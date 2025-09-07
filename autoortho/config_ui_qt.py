@@ -472,7 +472,10 @@ class ConfigUI(QMainWindow):
         self.save_button.clicked.connect(self.on_save)
 
         self.quit_button = StyledButton("Quit")
-        self.quit_button.clicked.connect(self.close)
+        
+        # Show Loaded Tiles - Close (when trying to close AutoOrtho)
+        self.quit_button.clicked.connect(lambda: ( __import__('tile_printer').stop_tile_printer(), self.close() ))
+        # End of Show Loaded Tiles - Close (when trying to close AutoOrtho)
 
         button_layout.addStretch()
         button_layout.addWidget(self.run_button)
@@ -712,6 +715,23 @@ class ConfigUI(QMainWindow):
 
         self.using_custom_tiles_check.stateChanged.connect(self.on_using_custom_tiles_check)
         options_layout.addWidget(self.using_custom_tiles_check)
+
+        # Show Loaded Tiles - Checkbox
+
+        self.show_loaded_tiles_check = QCheckBox("Show Loaded Tiles Info")
+        self.show_loaded_tiles_check.setChecked(
+            getattr(self.cfg.autoortho, "show_loaded_tiles", False)
+        )
+        self.show_loaded_tiles_check.setObjectName('show_loaded_tiles')
+        self.show_loaded_tiles_check.setToolTip(
+            "Enable this to display a window that shows the filename, count and size of downloaded/retrieved tiles, errors found, as well as the total tiles count/size.\n"
+            "NOTE: The window does not show/popup automatically when X-Plane is loading sceneries, you must alt-tab/open the window manually.\n"
+            "It is recommended to alt-tab/open the window before X-Plane starts loading the scenaries in order to avoid freezes/heavy loading times."
+        )
+        self.show_loaded_tiles_check.stateChanged.connect(self.on_show_loaded_tiles_check)
+        options_layout.addWidget(self.show_loaded_tiles_check)
+
+        # End of Show Loaded Tiles - Checkbox
 
 
         layout.addWidget(options_group)
@@ -1430,6 +1450,14 @@ class ConfigUI(QMainWindow):
         self.update_status_bar("Running")
         self.showMinimized()
 
+        # Show Loaded Tiles - Call
+
+        if getattr(self.cfg.autoortho, "show_loaded_tiles", False):
+            from tile_printer import start_tile_printer
+            start_tile_printer()
+
+        # End of Show Loaded Tiles - Call
+
     def on_save(self):
         """Handle Save button click"""
         # Check if the directory exists
@@ -1714,6 +1742,7 @@ class ConfigUI(QMainWindow):
 
         self.cfg.cache.auto_clean_cache = self.auto_clean_cache_check.isChecked()
         self.cfg.autoortho.using_custom_tiles = self.using_custom_tiles_check.isChecked()
+        self.cfg.autoortho.show_loaded_tiles = self.show_loaded_tiles_check.isChecked()
 
         # Windows specific
         if self.system == 'windows' and hasattr(self, 'winfsp_check'):
@@ -1836,6 +1865,19 @@ class ConfigUI(QMainWindow):
             self.cfg.autoortho.using_custom_tiles = True
 
         self.refresh_settings_tab()
+
+    # Show Loaded Tiles - Check State
+
+    def on_show_loaded_tiles_check(self, state):
+        from tile_printer import start_tile_printer, stop_tile_printer
+        if not self.running:
+            return
+        if state == 2:
+            start_tile_printer()
+        else:
+            stop_tile_printer()
+
+    # End of Show Loaded Tiles - Check State
 
     def apply_simheaven_compat(self, use_simheaven_overlay=False):
         """
