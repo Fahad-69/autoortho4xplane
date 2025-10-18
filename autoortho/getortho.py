@@ -332,6 +332,18 @@ class Chunk(object):
             if _is_jpeg(data[:3]):
                 #print(f"Found cache that is JPEG for {self}")
                 self.data = data
+
+                # Show Loaded Tiles - Message
+
+                if os.path.abspath(self.cache_dir) == os.path.abspath(CFG.paths.cache_dir):
+                    from tile_printer import send_tile_msg
+                    tile_filename = os.path.basename(self.cache_path)
+                    size_mb = len(data) / (1024 * 1024)
+                    msg = f"Retrieved: {tile_filename} ({size_mb:.2f} MB)"
+                    send_tile_msg(msg)
+
+                # End of Show Loaded Tiles - Message
+
                 return True
             else:
                 log.info(f"Loading file {self} not a JPEG! {data[:3]} path: {self.cache_path}")
@@ -380,6 +392,18 @@ class Chunk(object):
                     log.debug(f"Cache file already exists for {self}, skipping save (race) on attempt {attempt}")
                     return
                 os.replace(temp_filename, self.cache_path)
+
+                # Show Loaded Tiles - Message
+
+                if os.path.abspath(self.cache_dir) == os.path.abspath(CFG.paths.cache_dir):
+                    from tile_printer import send_tile_msg
+                    tile_filename = os.path.basename(self.cache_path)
+                    size_mb = len(data) / (1024 * 1024)
+                    msg = f"Downloaded: {tile_filename} ({size_mb:.2f} MB)"
+                    send_tile_msg(msg)
+
+                # End of Show Loaded Tiles - Message
+
                 return
             except FileExistsError:
                 try:
@@ -474,6 +498,16 @@ class Chunk(object):
                 log.warning(f"Failed with status {status_code} to get chunk {self}" + (" on server " + server if self.maptype.upper() in MAPTYPES_WITH_SERVER else "") + ".")
                 bump_many({f"http_{status_code}": 1, "req_err": 1})
 
+                # Show Loaded Tiles - Error Message
+
+                if os.path.abspath(self.cache_dir) == os.path.abspath(CFG.paths.cache_dir):
+                    from tile_printer import send_tile_msg
+                    tile_filename = os.path.basename(self.cache_path)
+                    msg = f"Error: Failed to Download {tile_filename} (HTTP {status_code})"
+                    send_tile_msg(msg)
+
+                # End of Show Loaded Tiles - Error Message
+
                 err = get_stat("req_err")
                 if err > 50:
                     ok = get_stat("req_ok")
@@ -500,6 +534,17 @@ class Chunk(object):
                 
         except Exception as err:
             log.warning(f"Failed to get chunk {self} on server {server}. Err: {err} URL: {self.url}")
+
+            # Show Loaded Tiles - Error Message
+
+            if os.path.abspath(self.cache_dir) == os.path.abspath(CFG.paths.cache_dir):
+                from tile_printer import send_tile_msg
+                tile_filename = os.path.basename(self.cache_path)
+                msg = f"Error: Exception for {tile_filename}: {err}"
+                send_tile_msg(msg)
+
+            # End of Show Loaded Tiles - Error Message
+            
             return False
         finally:
             if resp:

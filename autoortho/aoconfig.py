@@ -96,6 +96,8 @@ simheaven_compat = False
 using_custom_tiles = False
 # Color used for missing textures.
 missing_color = [66, 77, 55]
+# Shows the loaded tiles info, such as filename and size, in a simple GUI window.
+show_loaded_tiles = False
 
 [pydds]
 # ISPC or STB for dds file compression
