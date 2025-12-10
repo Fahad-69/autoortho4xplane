@@ -12,8 +12,13 @@
 #define FALSE 0
 
 AOIAPI void aoimage_delete(aoimage_t *img) {
-    if (img->ptr)
-        free(img->ptr);
+    // Prevent double-free by atomically clearing pointer first
+    uint8_t *ptr_to_free = img->ptr;
+    img->ptr = NULL;  // Clear pointer BEFORE freeing (atomic on x86/x64)
+    
+    if (ptr_to_free) {
+        free(ptr_to_free);
+    }
     memset(img, 0, sizeof(aoimage_t));
 }
 
@@ -345,7 +350,18 @@ AOIAPI int32_t aoimage_copy(const aoimage_t *s_img, aoimage_t *d_img, uint32_t s
 AOIAPI int32_t aoimage_from_memory(aoimage_t *img, const uint8_t *data, uint32_t len) {
     memset(img, 0, sizeof(aoimage_t));
 
-    // strange enough tj does not check the signture */
+    // Validate input parameters to prevent access violations
+    if (data == NULL) {
+        strcpy(img->errmsg, "data pointer is NULL");
+        return FALSE;
+    }
+    
+    if (len < 4) {
+        strcpy(img->errmsg, "data too short (< 4 bytes)");
+        return FALSE;
+    }
+
+    // Check JPEG signature (FFD8FF)
     uint32_t signature = *(uint32_t *)data & 0x00ffffff;
 
     if (signature != 0x00ffd8ff) {
@@ -365,7 +381,19 @@ AOIAPI int32_t aoimage_from_memory(aoimage_t *img, const uint8_t *data, uint32_t
     int subsamp, width, height, color_space;
 
     if (tjDecompressHeader3(tjh, data, len, &width, &height, &subsamp, &color_space) < 0) {
-        strncpy(img->errmsg, tjGetErrorStr2(tjh), sizeof(img->errmsg) - 1);
+        const char *err_str = tjGetErrorStr2(tjh);
+        if (err_str != NULL) {
+            strncpy(img->errmsg, err_str, sizeof(img->errmsg) - 1);
+            img->errmsg[sizeof(img->errmsg) - 1] = '\0';  // Ensure null termination
+        } else {
+            strcpy(img->errmsg, "tjDecompressHeader3 failed (no error string)");
+        }
+        goto err;
+    }
+    
+    // Validate dimensions to prevent allocation issues
+    if (width <= 0 || height <= 0 || width > 65536 || height > 65536) {
+        sprintf(img->errmsg, "invalid dimensions: %dx%d", width, height);
         goto err;
     }
 
@@ -382,7 +410,13 @@ AOIAPI int32_t aoimage_from_memory(aoimage_t *img, const uint8_t *data, uint32_t
     //printf("Pixel format: %d\n", TJPF_RGBA);
 
     if (tjDecompress2(tjh, data, len, img_buff, width, 0, height, TJPF_RGBA, TJFLAG_FASTDCT) < 0) {
-        strncpy(img->errmsg, tjGetErrorStr2(tjh), sizeof(img->errmsg) - 1);
+        const char *err_str = tjGetErrorStr2(tjh);
+        if (err_str != NULL) {
+            strncpy(img->errmsg, err_str, sizeof(img->errmsg) - 1);
+            img->errmsg[sizeof(img->errmsg) - 1] = '\0';  // Ensure null termination
+        } else {
+            strcpy(img->errmsg, "tjDecompress2 failed (no error string)");
+        }
         goto err;
     }
 
@@ -455,5 +489,87 @@ AOIAPI int32_t aoimage_desaturate(aoimage_t *img, float saturation) {
         ptr[2] = (uint8_t)(saturation * ptr[2] + x);
     }
 
+    return TRUE;
+}
+
+AOIAPI int32_t aoimage_crop_and_upscale(aoimage_t *src_img, aoimage_t *dst_img, 
+                                        uint32_t crop_x, uint32_t crop_y,
+                                        uint32_t crop_width, uint32_t crop_height,
+                                        uint32_t scale_factor) {
+    memset(dst_img, 0, sizeof(aoimage_t));
+    
+    // Validate inputs
+    assert(src_img->channels == 4);
+    
+    if (scale_factor == 0 || (scale_factor & (scale_factor - 1)) != 0) {
+        strcpy(dst_img->errmsg, "scale_factor must be power of 2");
+        return FALSE;
+    }
+    
+    // Bounds check
+    if (crop_x + crop_width > src_img->width) {
+        sprintf(dst_img->errmsg, "crop x bounds: %u + %u > %u", crop_x, crop_width, src_img->width);
+        return FALSE;
+    }
+    
+    if (crop_y + crop_height > src_img->height) {
+        sprintf(dst_img->errmsg, "crop y bounds: %u + %u > %u", crop_y, crop_height, src_img->height);
+        return FALSE;
+    }
+    
+    // Calculate destination dimensions
+    uint32_t dst_width = crop_width * scale_factor;
+    uint32_t dst_height = crop_height * scale_factor;
+    
+    // Check for overflow
+    unsigned long long num_pixels = (unsigned long long)dst_width * (unsigned long long)dst_height;
+    unsigned long long num_bytes = num_pixels * 4ULL;
+    if (num_pixels == 0ULL || (num_bytes / 4ULL) != num_pixels) {
+        strcpy(dst_img->errmsg, "destination size overflow");
+        return FALSE;
+    }
+    
+    // Allocate destination buffer
+    uint8_t *dest = malloc((size_t)num_bytes);
+    if (NULL == dest) {
+        sprintf(dst_img->errmsg, "can't malloc %llu bytes", num_bytes);
+        return FALSE;
+    }
+    
+    // Perform crop and upscale in one pass (nearest-neighbor)
+    // Read from source crop region, write each pixel scale_factor times in each direction
+    uint8_t *dst_ptr = dest;
+    
+    for (uint32_t src_y = 0; src_y < crop_height; ++src_y) {
+        uint32_t src_row_offset = ((crop_y + src_y) * src_img->width + crop_x) * 4;
+        
+        for (uint32_t rep_y = 0; rep_y < scale_factor; ++rep_y) {
+            for (uint32_t src_x = 0; src_x < crop_width; ++src_x) {
+                // Get source pixel
+                uint32_t src_offset = src_row_offset + src_x * 4;
+                uint8_t r = src_img->ptr[src_offset];
+                uint8_t g = src_img->ptr[src_offset + 1];
+                uint8_t b = src_img->ptr[src_offset + 2];
+                uint8_t a = src_img->ptr[src_offset + 3];
+                
+                // Replicate pixel scale_factor times horizontally
+                for (uint32_t rep_x = 0; rep_x < scale_factor; ++rep_x) {
+                    *dst_ptr++ = r;
+                    *dst_ptr++ = g;
+                    *dst_ptr++ = b;
+                    *dst_ptr++ = a;
+                }
+            }
+        }
+    }
+    
+    // Set destination image properties
+    dst_img->ptr = dest;
+    dst_img->width = dst_width;
+    dst_img->height = dst_height;
+    dst_img->stride = dst_width * 4;
+    dst_img->channels = 4;
+    
+    assert(dst_ptr == dest + num_bytes);
     return TRUE;
 }

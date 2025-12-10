@@ -28,7 +28,7 @@ import winsetup
 import macsetup
 from utils.mount_utils import (
     cleanup_mountpoint,
-    _is_nuitka_compiled,
+    _is_frozen,
     is_only_ao_placeholder,
     clear_ao_placeholder,
 )
@@ -410,19 +410,20 @@ class AOMount:
 
         env['AO_RUN_MODE'] = 'macfuse_worker'
 
-        # Build the argv. In Nuitka, re-exec the app binary. In dev, run the module.
-        if _is_nuitka_compiled():
+        # Build the argv. When frozen (PyInstaller), re-exec the app binary. In dev, run the module.
+        if _is_frozen():
             cmd = [sys.executable]
         else:
             cmd = [sys.executable, "-m", "autoortho"]
         # Worker arguments (parsed by macfuse_worker.main via the early-dispatch)
-        cmd += ["--root", root, "--mountpoint", mountpoint, "--loglevel", "DEBUG" if self.cfg.general.debug else "INFO"]
+        loglevel = getattr(self.cfg.general, 'file_log_level', 'INFO').upper()
+        cmd += ["--root", root, "--mountpoint", mountpoint, "--loglevel", loglevel]
         if volname:
             cmd += ["--volname", volname]
         if nothreads:
             cmd.append("--nothreads")
 
-        log.debug("Launching worker: compiled=%s exe=%s cmd=%s", _is_nuitka_compiled(), sys.executable, cmd)
+        log.debug("Launching worker: frozen=%s exe=%s cmd=%s", _is_frozen(), sys.executable, cmd)
 
         log_dir = Path.home() / ".autoortho-data" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -605,11 +606,12 @@ class AOMount:
                         pass
                     log.info("STATS: %s", filtered)
                 except Exception as e:
-                    log.debug("reporter(): %s", e)
+                    log.error("reporter() exception: %s", e, exc_info=True)
 
         t = threading.Thread(target=_reporter_loop, name="AO-Reporter", daemon=True)
         t.start()
         self._reporter_thread = t
+        log.info("Stats reporter thread started (will log every %.1f seconds)", interval_sec)
 
     def stop_reporter(self, join_timeout: float = 3.0):
         """Stop the periodic global-stats logger and join the thread."""
@@ -900,6 +902,9 @@ def main():
     # Start helper threads
     ftrack.start()
 
+    from datareftrack import dt
+    dt.start()
+    
     # Run things
     if args.root and args.mountpoint:
         # Just mount specific requested dirs
@@ -928,6 +933,7 @@ def main():
             cfgui = AOMountUI(CFG)
             cfgui.setup()
 
+    dt.stop()
     flighttrack.ft.stop()
 
     log.info("AutoOrtho exit.")
