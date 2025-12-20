@@ -243,11 +243,49 @@ exe = EXE(
     contents_directory='ao_files',  # Custom folder name instead of '_internal'
 )
 
+tile_printer_analysis = Analysis(
+    [os.path.join(autoortho_path, 'tile_printer_gui.py')],
+    pathex=[autoortho_path],
+    binaries=[],
+    datas=[],
+    hiddenimports=hiddenimports,
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[],
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
+    cipher=block_cipher,
+    noarchive=False,
+)
+tile_printer_pyz = PYZ(tile_printer_analysis.pure, tile_printer_analysis.zipped_data, cipher=block_cipher)
+
+tile_printer_gui_exe = EXE(
+    tile_printer_pyz,
+    tile_printer_analysis.scripts,
+    [],
+    exclude_binaries=True,
+    name='tile_printer_gui',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    console=False,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    icon=icon_path,
+    contents_directory='ao_files',
+)
+
 # =============================================================================
 # COLLECT (bundle everything together)
 # =============================================================================
 coll = COLLECT(
     exe,
+    tile_printer_gui_exe,
     a.binaries,
     a.zipfiles,
     a.datas,

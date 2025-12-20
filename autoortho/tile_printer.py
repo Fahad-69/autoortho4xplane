@@ -44,8 +44,13 @@ def send_tile_msg(msg):
 def start_tile_printer():
     global tile_printer_proc, _sender_thread
     if tile_printer_proc is None:
-        script_path = os.path.join(os.path.dirname(__file__), "tile_printer_gui.py")
-        tile_printer_proc = subprocess.Popen([sys.executable, script_path])
+        if getattr(sys, 'frozen', False):
+            exe_dir = os.path.dirname(sys.executable)
+            exe_path = os.path.join(exe_dir, "tile_printer_gui.exe")
+            tile_printer_proc = subprocess.Popen([exe_path])
+        else:
+            script_path = os.path.join(os.path.dirname(__file__), "tile_printer_gui.py")
+            tile_printer_proc = subprocess.Popen([sys.executable, script_path])
     if _sender_thread is None:
         _sender_thread = threading.Thread(target=_sender, daemon=True)
         _sender_thread.start()
