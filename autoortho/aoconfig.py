@@ -319,6 +319,8 @@ missing_color = [66, 77, 55]
 # due to file locking (mainly on Windows).
 # Recommended: True for disk space optimization
 cleanup_orphan_jpegs_on_exit = True
+# Shows the loaded tiles info, such as filename and size, in a simple GUI window.
+show_loaded_tiles = False
 
 [pydds]
 # ISPC or STB for dds file compression
