@@ -17,7 +17,8 @@ class TestDatarefTrackerInit:
         # Check flight data initialized correctly
         assert dt.lat == -1.0
         assert dt.lon == -1.0
-        assert dt.alt == -1.0
+        assert dt.alt_agl_m == -1.0  # AGL altitude in meters
+        assert dt.alt_agl_ft == -1.0  # AGL altitude in feet
         assert dt.hdg == -1.0
         assert dt.spd == -1.0
         assert dt.connected is False
@@ -129,7 +130,8 @@ class TestDatarefTrackerThreadSafety:
         with dt._lock:
             dt.lat = 47.5
             dt.lon = -122.3
-            dt.alt = 1000.0
+            dt.alt_agl_ft = 1000.0  # AGL altitude in feet
+            dt.alt_agl_m = 1000.0 / 3.28084  # AGL altitude in meters
             dt.hdg = 180.0
             dt.spd = 50.0
             dt.connected = True
@@ -141,7 +143,7 @@ class TestDatarefTrackerThreadSafety:
         assert data is not None
         assert data['lat'] == 47.5
         assert data['lon'] == -122.3
-        assert data['alt'] == 1000.0
+        assert data['alt_agl_ft'] == 1000.0  # Now uses AGL altitude
         assert data['hdg'] == 180.0
         assert data['spd'] == 50.0
         assert data['connected'] is True
@@ -178,7 +180,8 @@ class TestDatarefTrackerThreadSafety:
         with dt._lock:
             dt.lat = 47.5
             dt.lon = -122.3
-            dt.alt = 1000.0
+            dt.alt_agl_ft = 1000.0  # AGL altitude in feet
+            dt.alt_agl_m = 1000.0 / 3.28084  # AGL altitude in meters
             dt.hdg = 180.0
             dt.spd = 50.0
             dt.connected = True
@@ -219,7 +222,7 @@ class TestDatarefTrackerDecodePacket:
         """Test decoding a valid RREF packet."""
         dt = datareftrack.DatarefTracker()
 
-        # Build a valid RREF packet with 5 values
+        # Build a valid RREF packet with 5 values (essential datarefs)
         header = b"RREF\x00"
         values = []
         for i in range(5):
@@ -230,12 +233,39 @@ class TestDatarefTrackerDecodePacket:
 
         result = dt._decode_packet(packet)
 
-        assert len(result) == 5
+        # Returns all 7 datarefs (fills in -1.0 for missing optional ones)
+        assert len(result) == len(dt.datarefs)
         assert result[0] == 0.0
         assert result[1] == 10.0
         assert result[2] == 20.0
         assert result[3] == 30.0
         assert result[4] == 40.0
+        # Optional datarefs filled with -1.0
+        assert result[5] == -1.0
+        assert result[6] == -1.0
+
+    def test_decode_packet_out_of_order(self):
+        """Test decoding packet with values in non-sequential order."""
+        dt = datareftrack.DatarefTracker()
+
+        # Build a packet with values in reverse order (testing the bug fix)
+        header = b"RREF\x00"
+        values = []
+        # Send indices 4,3,2,1,0 in that order
+        for i in [4, 3, 2, 1, 0]:
+            values.append(struct.pack("<if", i, float(i * 10)))
+
+        packet = header + b"".join(values)
+
+        result = dt._decode_packet(packet)
+
+        # Values should be correctly placed by index, not by packet order
+        assert len(result) == len(dt.datarefs)
+        assert result[0] == 0.0   # Index 0 should have value 0.0
+        assert result[1] == 10.0  # Index 1 should have value 10.0
+        assert result[2] == 20.0  # Index 2 should have value 20.0
+        assert result[3] == 30.0  # Index 3 should have value 30.0
+        assert result[4] == 40.0  # Index 4 should have value 40.0
 
     def test_decode_packet_invalid_header(self):
         """Test decoding packet with wrong header."""
@@ -290,9 +320,9 @@ class TestDatarefTrackerDecodePacket:
 
         result = dt.DecodePacket(packet)
 
-        # Legacy method returns dict
+        # Legacy method returns dict with all datarefs
         assert isinstance(result, dict)
-        assert len(result) == 5
+        assert len(result) == len(dt.datarefs)
         assert result[0][0] == 0.0  # value
         assert result[1][0] == 10.0
         # Check tuple structure (value, unit, dataref_name)
@@ -349,8 +379,8 @@ class TestDatarefTrackerRequestDatarefs:
 
         dt._request_datarefs(subscribe=True)
 
-        # Should send 5 messages (one per dataref)
-        assert dt.sock.sendto.call_count == 5
+        # Should send one message per dataref
+        assert dt.sock.sendto.call_count == len(dt.datarefs)
 
         # Check first message was sent correctly
         first_call = dt.sock.sendto.call_args_list[0]
@@ -369,8 +399,8 @@ class TestDatarefTrackerRequestDatarefs:
 
         dt._request_datarefs(subscribe=False)
 
-        # Should send 5 unsubscribe messages
-        assert dt.sock.sendto.call_count == 5
+        # Should send one unsubscribe message per dataref
+        assert dt.sock.sendto.call_count == len(dt.datarefs)
 
         # Verify it's an unsubscribe message (freq=0)
         first_call = dt.sock.sendto.call_args_list[0]
@@ -562,9 +592,11 @@ class TestDatarefTrackerIntegration:
                 data, addr = server_sock.recvfrom(1024)
 
                 # Send back a response packet with flight data
+                # Values: lat, lon, y_agl (meters), hdg, spd
+                # Note: y_agl is in meters and will be converted to feet
                 header = b"RREF\x00"
                 values = []
-                test_data = [47.5, -122.3, 1000.0, 180.0, 50.0]
+                test_data = [47.5, -122.3, 304.8, 180.0, 50.0]  # 304.8m = 1000ft AGL
                 for i, val in enumerate(test_data):
                     values.append(struct.pack("<if", i, val))
                 response = header + b"".join(values)
@@ -603,7 +635,8 @@ class TestDatarefTrackerIntegration:
             if data is not None:
                 assert data['lat'] == 47.5
                 assert data['lon'] == -122.3
-                assert data['alt'] == 1000.0
+                # alt_agl_ft is 304.8m * 3.28084 ≈ 1000ft (allow small float error)
+                assert abs(data['alt_agl_ft'] - 1000.0) < 1.0
                 assert data['connected'] is True
                 assert data['data_valid'] is True
 

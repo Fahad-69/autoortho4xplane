@@ -15,3 +15,6 @@ release/
 *.bin
 .version
 dist/
+docs/internal/
+logs/
+.claude/

@@ -5,14 +5,21 @@ import ast
 import pprint
 import configparser
 from types import SimpleNamespace
-from utils.constants import system_type
+
+# Handle imports for both frozen (PyInstaller) and direct Python execution
+try:
+    from autoortho.utils.constants import system_type
+except ImportError:
+    from utils.constants import system_type
 
 import logging
 log = logging.getLogger(__name__)
 
 class SectionParser(object):
-    true = ['true','1', 'yes', 'on']
-    false = ['false', '0', 'no', 'off']
+    # Note: '0' and '1' are NOT treated as booleans to avoid corrupting numeric settings
+    # Settings like native_pipeline_threads=0 should stay as integers, not become False
+    true = ['true', 'yes', 'on']
+    false = ['false', 'no', 'off']
 
     def __init__(self, /, **kwargs):
         for k, v in kwargs.items():
@@ -20,21 +27,52 @@ class SectionParser(object):
             sv = '' if v is None else str(v)
             s = sv.strip()
 
-            # Detect booleans
-            if s.lower() in self.true:
-                parsed_val = True
-            elif s.lower() in self.false:
-                parsed_val = False
-            # Detect list
-            elif s.startswith('[') and s.endswith(']'):
+            # Detect list first (before other parsing)
+            if s.startswith('[') and s.endswith(']'):
                 try:
                     parsed_val = ast.literal_eval(s)
                 except Exception:
+                    parsed_val = s
+            # Detect booleans (text-only, not '0'/'1' to avoid corrupting numbers)
+            elif s.lower() in self.true:
+                parsed_val = True
+            elif s.lower() in self.false:
+                parsed_val = False
+            # Try to parse as integer
+            elif s.lstrip('-').isdigit():
+                try:
+                    parsed_val = int(s)
+                except ValueError:
+                    parsed_val = s
+            # Try to parse as float
+            elif self._is_float(s):
+                try:
+                    parsed_val = float(s)
+                except ValueError:
                     parsed_val = s
             else:
                 parsed_val = s
 
             self.__dict__.update({k: parsed_val})
+    
+    @staticmethod
+    def _is_float(s):
+        """Check if string looks like a float (contains decimal point or scientific notation)."""
+        if not s:
+            return False
+        # Remove leading minus sign for checking
+        s_check = s.lstrip('-')
+        # Must contain at least one digit
+        if not any(c.isdigit() for c in s_check):
+            return False
+        # Check for float patterns: decimal point or scientific notation
+        if '.' in s_check or 'e' in s_check.lower():
+            try:
+                float(s)
+                return True
+            except ValueError:
+                return False
+        return False
 
     def __repr__(self):
         items = (f"{k}={v!r}" for k, v in self.__dict__.items())
@@ -87,21 +125,213 @@ min_zoom = 12
 max_zoom = 16
 # Maximum zoom level to allow near airports. Zoom level around airports used by default is 18.
 max_zoom_near_airports = 18
-# Max time to wait for images.  Higher numbers mean better quality, but more
-# stutters.  Lower numbers will be more responsive at the expense of
-# ocassional low quality tiles.
-maxwait = 0.5
+# Dynamic zoom mode: "fixed" (current behavior) or "dynamic" (altitude-based quality steps)
+# Fixed: Uses max_zoom slider value for all tiles
+# Dynamic: Uses altitude-based quality steps defined in dynamic_zoom_steps
+max_zoom_mode = fixed
+# Quality steps for dynamic zoom mode. List of altitude/zoom pairs.
+# Format: [{{"altitude_ft": <altitude>, "zoom_level": <zoom>}}, ...]
+# Example: [{{"altitude_ft": 0, "zoom_level": 17}}, {{"altitude_ft": 20000, "zoom_level": 15}}]
+# Altitude is "at or above" - tiles are rendered at the zoom level of the highest matching altitude.
+# The base step (altitude_ft: 0) cannot be removed and serves as the ground-level default.
+dynamic_zoom_steps = []
+# Per-chunk maximum wait time in seconds. This limits how long to wait for a SINGLE
+# chunk download before moving on. Works in combination with tile_time_budget:
+# - tile_time_budget: Total time for entire tile (all chunks combined)
+# - maxwait: Maximum time per individual chunk download
+# A chunk download will end when EITHER limit is reached, whichever comes first.
+# This prevents a single slow chunk from consuming the entire tile budget.
+# Recommended: 2.0 (fast networks), 5.0 (normal), 10.0 (slow networks)
+maxwait = 2.0
 # Temporarily increase maxwait to an effectively infinite value while X-Plane is
 # loading scenery data prior to starting the flight.  This allows more downloads to
 # succeed and reduce the use of backup chunks and missing chunks at the start of flight.
 suspend_maxwait = True
+# Use time budget system for tile requests. When enabled, the tile_time_budget
+# value represents the total wall-clock time for an ENTIRE tile (all mipmaps),
+# providing more predictable loading times. When disabled, falls back to legacy
+# per-chunk maxwait timing.
+use_time_budget = True
+# Maximum wall-clock time in seconds for a COMPLETE tile (all 5 mipmap levels).
+# IMPORTANT: This measures ACTIVE PROCESSING time only - queue wait time doesn't count.
+# The budget starts when chunks actually begin downloading, not when the tile is first requested.
+# This ensures fair time allocation when many tiles are requested simultaneously.
+# After this time, the tile is built with whatever has been downloaded.
+# Lower = faster loading, but may have more partial/blurry tiles
+# Higher = better quality, but longer initial load times
+# Recommended: 15.0 (very fast), 30.0 (balanced), 60.0 (quality)
+# Note: Higher values (120+) can cause multi-minute stalls when cache eviction occurs
+tile_time_budget = 180.0
+# Fallback level when chunks fail to download in time:
+# none = Skip all fallbacks (fastest, may have missing tiles)
+# cache = Use disk cache and already-built mipmaps, no network (balanced)
+# full = All fallbacks including on-demand network downloads (best quality, slowest)
+# Recommended: cache for most users, full if you have fast internet and CPU
+fallback_level = cache
+# When enabled with fallback_level=full, network fallbacks will continue even after
+# the tile time budget is exhausted. This prioritizes quality over strict timing.
+# True = Better quality, may cause longer load times when network is slow
+# False = Strict timing, fallbacks respect budget (may have more missing tiles)
+# Recommended: False for stutter-free experience, True for maximum quality
+fallback_extends_budget = False
+# Timeout per mipmap level when using extended fallbacks (in seconds)
+# When fallback_extends_budget is True, each lower-detail mipmap level
+# gets this much time to download. Total extra time = this * number of levels tried.
+# Example: 10 seconds * 4 levels = 40 seconds max additional time
+# Range: 10 - 120 seconds
+# Recommended: 3.0 (balanced), 5.0 (quality), 1.5 (fast)
+fallback_timeout = 30.0
+# Spatial prefetching - proactively downloads tiles ahead of aircraft
+# Enable/disable prefetching (True/False)
+prefetch_enabled = True
+# How far ahead to prefetch in minutes of flight time (1-60)
+# Higher = more tiles prefetched ahead, uses more bandwidth and memory
+# Lower = fewer tiles prefetched, less resource usage
+# Recommended: 15 (fast aircraft), 30 (balanced), 60 (slow internet or long haul)
+# Set to 0 for Unlimited lookahead (continues until max_chunks or other limits)
+prefetch_lookahead = 30
+# How often to check for prefetch opportunities in seconds (1-10)
+prefetch_interval = 2.0
+# Maximum chunks to prefetch per cycle (8-512)
+prefetch_max_chunks = 48
+# Prefetch radius in nautical miles (10-150)
+# Tiles within this radius of the flight path are prefetched
+# Used by both velocity-based and SimBrief prefetching
+prefetch_radius_nm = 40
+# Predictive DDS generation - pre-build DDS textures in background after prefetch
+# When enabled, tiles are compressed to DDS in the background, eliminating stutters
+# when X-Plane loads new scenery areas. Falls back gracefully on cache miss.
+predictive_dds_enabled = True
+# Minimum interval between DDS builds in milliseconds (100-2000)
+# Rate limits background builds to prevent CPU spikes during flight
+# Lower = faster building, higher CPU usage
+# Higher = slower building, lower CPU usage
+# Recommended: 250 (fast CPU), 500 (balanced), 1000 (low-end CPU)
+predictive_dds_build_interval_ms = 500
+# Number of parallel prefetch workers for predictive DDS builds (1-8)
+# These run in the background to pre-build tiles ahead of where you're flying
+# Higher values = faster prefetch throughput, but more CPU usage during flight
+# Lower values = less CPU impact, slower prefetch
+# Recommended: 2 (low-end CPU or battery saving), 4 (balanced, default), 6-8 (fast CPU)
+background_builder_workers = 4
+# Number of concurrent tile build workers (1-32)
+# Controls how many tiles can be built simultaneously by the native pipeline
+# Higher values = faster tile processing, more CPU/RAM usage
+# Lower values = less resource usage, potential stutters
+# Recommended: 4 (low-end), 8 (mid-range, default), 16-32 (high-end CPU)
+live_builder_concurrency = 8
+# Apply fallbacks when pre-building DDS (True/False)
+# True (default): Apply same fallback logic as live requests (cache search, lower zoom, etc.)
+#   - Pro: Prebuilt tiles have best possible quality with fallbacks for failed chunks
+#   - Con: Prebuilds may do extra disk/network I/O to find fallback data
+# False: Use missing color for failed chunks (no fallbacks, fastest)
+#   - Pro: Faster prebuilds, no extra I/O
+#   - Con: Failed chunks show missing color instead of fallback data
+predictive_dds_use_fallbacks = True
+# Disk cache size for pre-built DDS textures in MB (1024-16384)
+# Pre-built DDS files are stored on disk (SSD reads are ~1-2ms, fast enough)
+# The OS file cache naturally keeps hot files in RAM when memory is available
+# Uses temp directory, auto-cleaned on session end
+# Recommended: 4096 (balanced), 8192 (large flights), 16384 (max capacity)
+ephemeral_dds_cache_mb = 4096
+# Persistent DDS cache - stores pre-built DDS textures across sessions
+# Eliminates JPEG decode + DXT compress on subsequent loads (~1-2ms read vs ~390ms rebuild)
+# Set to 0 to disable persistent DDS caching
+# Recommended: 4096 (balanced), 8192 (large regions), 0 (disk constrained)
+persistent_dds_cache_mb = 4096
+# Disk budget enforcement - automatically cleans up old cache data
+# When total cache exceeds file_cache_size, oldest data is evicted
+# Categories: DDS cache (compiled textures), JPEGs (source images)
+disk_budget_enabled = True
+# Percentage of file_cache_size allocated to persistent DDS cache (10-90)
+dds_budget_pct = 80
+# Maximum threads for native pipeline operations (per concurrent build)
+# 0 = auto (dynamically divides CPU cores across concurrent builds)
+# >0 = fixed thread count per build (e.g., 4 means each build uses 4 threads)
+native_pipeline_threads = 0
+# Pipeline mode for DDS texture building
+# auto: Automatically select best mode for your platform (recommended)
+#       With buffer pool optimization, hybrid is fastest on all platforms
+#       (Python file reads are OS-cache optimized, 10ms vs 21ms for C)
+# native: Full native pipeline (C handles file I/O + decode + compress)
+#         Uses more threads, may be better for cold cache scenarios
+# hybrid: Python reads files, native decode + compress (recommended)
+#         Fastest with buffer pool, lower thread overhead
+# python: Pure Python fallback (slowest but most compatible)
+#         Use if native pipeline causes issues
+pipeline_mode = auto
+# Number of pre-allocated buffers for zero-copy DDS building (2-64)
+# Buffer size is calculated dynamically based on your zoom settings:
+#   - ~11MB per buffer when max_zoom <= 16 and max_zoom_near_airports <= 18 (4K textures)
+#   - ~43MB per buffer when higher zoom levels are configured (8K textures)
+#   - ~43MB per buffer when using custom tiles (assumes worst case)
+# 
+# Default: Automatically calculated as (prefetch_workers + live_builder_concurrency)
+# This ensures optimal parallelism: each worker can have its own buffer.
+# Maximum is capped to (prefetch_workers + live_builder_concurrency) since
+# more buffers than workers would never be used simultaneously.
+# 
+# The value here (10) is a reasonable fallback = 2 prefetch + 8 live (defaults)
+buffer_pool_size = 10
+# === LIVE AOPIPELINE SETTINGS ===
+# These control the optimized pipeline for live (on-demand) DDS builds when
+# X-Plane requests tiles that aren't in the predictive cache.
+#
+# Enable optimized aopipeline for live DDS builds (True/False)
+# When enabled, attempts to build entire tile with native pipeline (~5x faster)
+# when sufficient chunks are available. Falls back to progressive path on failure.
+# Recommended: True (enables fast path when chunks are cached/prefetched)
+live_aopipeline_enabled = True
+# Threshold ratio of chunks that triggers an early DDS build (0.5-1.0)
+# Controls a two-phase build strategy:
+#   1. Early build: fires when this ratio is reached, missing chunks filled with missing_color
+#   2. Healing pass: fires automatically when the remaining chunks arrive, replacing placeholders
+# 1.0 = wait for all chunks before building (single pass, no healing needed)
+# 0.9 = build at 90%%, heal remaining 10%% when they arrive (faster first texture, then corrected)
+# 0.5 = build at 50%% (fastest first texture, more healing work)
+# Recommended: 1.0 (quality, no artifacts), 0.9 (balanced), 0.8 (faster)
+live_aopipeline_min_chunk_ratio = 1.0
+# === STREAMING BUILDER SETTINGS ===
+# Enable streaming builder for incremental DDS generation (True/False)
+# When enabled, chunks are processed as they arrive rather than in batch.
+# This allows fallbacks to be applied during the build process.
+# Recommended: True (better fallback support), False for legacy behavior
+streaming_builder_enabled = True
+# Size of the streaming builder pool (2-64)
+# Each builder handles one tile at a time. Pool size determines
+# how many tiles can be built concurrently.
+# Recommended: 4 (default), increase to 8-16 for faster CPUs, up to 64 for high-end systems
+streaming_builder_pool_size = 4
+# === TILE QUEUE SETTINGS ===
+# When all buffer pool slots are busy, tiles wait in a queue instead of
+# falling back to the slower Python pipeline. This ensures consistent
+# performance and prevents resource contention.
+#
+# Enable tile queue system with priority (True/False)
+# When enabled, tiles wait for pool slots using a priority queue:
+# - Live tiles (X-Plane requests) = "premium clients", served first
+# - Prefetch tiles = low priority, served when system is idle
+# Recommended: True for consistent performance
+tile_queue_enabled = True
+# Maximum tiles that can wait in queue (10-500)
+# If queue is full, additional tiles are rejected
+# Higher = more tiles can wait, but uses more memory for tracking
+# Recommended: 100 (default)
+tile_queue_max_size = 100
 fetch_threads = 32
 # Simheaven compatibility mode.
 simheaven_compat = False
 # Using custom generated Ortho4XP tiles along with AutoOrtho.
 using_custom_tiles = False
-# Color used for missing textures.
+# Color used for missing textures. an
 missing_color = [66, 77, 55]
+# === CACHE CLEANUP SETTINGS ===
+# Clean up orphan JPEG files on program exit (True/False)
+# Deletes temporary JPEG files whose data is safely stored in bundles.
+# This recovers disk space from files that couldn't be deleted during runtime
+# due to file locking (mainly on Windows).
+# Recommended: True for disk space optimization
+cleanup_orphan_jpegs_on_exit = True
 # Shows the loaded tiles info, such as filename and size, in a simple GUI window.
 show_loaded_tiles = False
 
@@ -110,17 +340,30 @@ show_loaded_tiles = False
 compressor = ISPC
 # BC1 or BC3 for dxt1 or dxt5 respectively
 format = BC1
+# Disk compression for cached DDS files (none or zstd)
+# zstd reduces cache disk usage by 30-60% with ~2-5ms added read latency
+# none stores raw DDS data (fastest reads, largest disk usage)
+dds_compression = zstd
+# Zstd compression level (1-19, default 3)
+# Higher = smaller files, slower writes (reads are always fast)
+# Background builds can afford higher levels since writes are async
+# Recommended: 3 (balanced), 6 (smaller files), 1 (fastest writes)
+dds_compression_level = 3
 
 [scenery]
 # Don't cleanup downloads
 noclean = False
+# Maximum parallel download workers for scenery packages (1-8)
+# Higher values download more files simultaneously, saturating bandwidth faster
+# Recommended: 4 (default), 2 (slow connection), 8 (fast connection)
+max_download_workers = 4
 
 [fuse]
 # Enable or disable multi-threading when using FUSE
-threading = {False if system_type == "darwin" else True}
-# Timeout in seconds for tile build operations. If a tile takes longer than this,
-# a placeholder will be shown instead of crashing X-Plane. Default: 60
-build_timeout = 60
+threading = True
+# NOTE: build_timeout (FUSE lock timeout) is calculated dynamically based on
+# tile_time_budget. Formula: tile_time_budget + fallback_timeout (if enabled) + 15s.
+# This ensures the lock timeout always exceeds the maximum possible tile build time.
 
 [flightdata]
 # Local port for map and stats
@@ -145,8 +388,49 @@ fal_saturation = 80.0
 win_saturation = 55.0
 compress_dsf = True
 
+[terrain]
+# Default SUPER_ROUGHNESS value for .ter files (0.0 to 1.0)
+# Higher values make terrain less reflective/shiny at sunset/sunrise
+default_roughness = 1.0
+# Number of workers for .ter file patching
+ter_patch_workers = 8
+
 [windows]
 prefer_winfsp = True
+
+[time_exclusion]
+# Enable sun-position-based AutoOrtho exclusion.
+# When active, AutoOrtho scenery is disabled at night and X-Plane uses its default scenery.
+# The sun elevation angle (from sim/graphics/scenery/sun_pitch_degrees) determines day/night.
+# This is accurate across seasons, latitudes, and with time acceleration.
+enabled = False
+# When enabled, assume exclusion is active until sun position data is available.
+# Useful to ensure night flights start with default scenery from the beginning.
+# When disabled, AutoOrtho works normally until sun data confirms exclusion.
+default_to_exclusion = False
+# Sun elevation threshold to switch to night mode (degrees).
+# Nautical twilight (-12) is when artificial lights dominate the landscape.
+# Range: -18 (astronomical twilight) to 0 (horizon).
+sun_night_threshold = -12.0
+# Sun elevation threshold to switch to day mode (degrees).
+# Should be higher than night threshold to provide hysteresis and prevent rapid toggling.
+sun_day_threshold = -10.0
+
+[simbrief]
+# SimBrief user ID for flight plan integration
+userid = 
+# Use SimBrief flight data for dynamic zoom level and pre-fetching calculations
+use_flight_data = False
+# Radius in nautical miles to consider fixes when calculating altitude for a tile
+# All fixes within this radius are considered, and the lowest altitude is used
+route_consideration_radius_nm = 50
+# If the aircraft deviates more than this distance (nm) from the route, fall back to DataRef-based calculations
+route_deviation_threshold_nm = 40
+# Allow prefetching while parked when SimBrief flight plan is loaded
+# With a known route, we don't need to wait for aircraft movement to start prefetching
+prefetch_while_parked = True
+# Radius in nautical miles around waypoints to prefetch tiles (now in Advanced Settings)
+route_prefetch_radius_nm = 40
 """
 
     def __init__(self, conf_file=None):
@@ -306,9 +590,12 @@ prefer_winfsp = True
         } for s in sceneries]
 
 
-        if not os.path.exists(self.ao_scenery_path):
-            log.info(f"Creating dir {self.ao_scenery_path}")
-            os.makedirs(self.ao_scenery_path)
+        if self.paths.scenery_path and not os.path.exists(self.ao_scenery_path):
+            try:
+                log.info(f"Creating dir {self.ao_scenery_path}")
+                os.makedirs(self.ao_scenery_path)
+            except OSError as e:
+                log.warning(f"Could not create scenery dir {self.ao_scenery_path}: {e}")
 
         # If we patched any values during load, persist them now so next run is stable.
         # Only save in the main process - workers must not write config files.

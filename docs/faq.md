@@ -39,16 +39,199 @@ If AutoOrtho suddenly stops working after it previously worked, check that the `
 
 ## General Issues
 
-### I see occasional blurry and/or green tiles
-There is a timeout for how long the system waits for individual satellite
-images.  You can adjust how long the system waits for high resolution
-images by adjusting the 'max_wait' setting (in seconds) in your configuration
-file.  Lower resolution tiles are used when available as a fall back.  The
-green tile is used as a last resort.
+<a name="missing-color-tiles"></a>
+### I see occasional blurry and/or green (missing color) tiles
 
-By making this too high you risk introducing lag, stuttering, and delays.
-However this may need to be increased for users that are far from source
-servers or have slow internet connections.
+Missing color tiles (typically green) occur when AutoOrtho cannot retrieve imagery within the time budget. This section explains why this happens and how to minimize it.
+
+#### Why do missing color tiles happen?
+
+1. **Time Budget Exhaustion:** Each tile request has a time limit. If chunks don't download in time, they may appear as missing color.
+2. **Network Issues:** Slow or unreliable internet connections cause downloads to timeout.
+3. **Server Issues:** The imagery servers may be slow or temporarily unavailable.
+4. **CPU Limitations:** If your CPU can't decode images fast enough, chunks may not complete in time.
+
+#### How to minimize missing color tiles
+
+**Option 1 - Lower Zoom Level (Most Effective):**
+Each zoom level requires 4× more resources. Lowering your max zoom dramatically reduces missing tiles:
+1. Open AutoOrtho Settings
+2. Lower "Max Zoom Level" from ZL17/18 to ZL16 or ZL15
+3. This reduces chunks per tile from 1024/4096 down to 256/64
+
+**Option 2 - Increase Time Budget:**
+1. Open AutoOrtho Settings
+2. Go to the Settings tab → Performance Tuning section
+3. Increase "Tile Time Budget" to 15-20 seconds
+4. This gives more time for chunks to download
+
+**Option 3 - Enable Full Fallbacks:**
+1. Set "Fallback Level" to "Full (Best Quality)"
+2. Enable "Allow fallbacks to extend time budget"
+3. This allows AutoOrtho to download lower-detail alternatives when high-detail fails
+
+**Recommended settings for minimal missing tiles:**
+```ini
+maptype_override_zoom = 16
+use_time_budget = True
+tile_time_budget = 300.0
+fallback_level = full
+fallback_extends_budget = True
+```
+
+**Trade-off Warning:** Higher time budgets and extended fallbacks may cause longer loading times and occasional stuttering. See the [Performance Tuning Guide](performance.md) for a detailed explanation of the quality vs. speed trade-off.
+
+---
+
+### Why are there so many missing tiles even with "Full" fallback enabled?
+
+If you're seeing many missing tiles with `fallback_level = full`, check these:
+
+1. **Budget still limiting fallbacks:** By default, even with "full" fallbacks, network fallbacks respect the time budget. Enable "Allow fallbacks to extend time budget" (`fallback_extends_budget = True`) to let fallbacks continue after the budget is exhausted.
+
+2. **New area without cache:** The first time you fly over an area, there's no cached data for fallbacks to use. Fly the same route again and you should see fewer missing tiles.
+
+3. **All fallbacks failing:** In rare cases (server issues, network problems), all fallback levels may fail. Check the AutoOrtho logs for error messages.
+
+---
+
+### How do I get the smoothest flying experience with minimal stutters?
+
+Stuttering occurs when X-Plane waits for AutoOrtho to provide imagery. To minimize stutters:
+
+1. **Use Time Budget System:** Keep `use_time_budget = True` (default)
+2. **Use reasonable budget:** Set `tile_time_budget` to 180-300 seconds
+3. **Use cache-only fallbacks:** Set `fallback_level = cache` to avoid network delays during fallbacks
+4. **Enable prefetching:** Keep `prefetch_enabled = True` to download tiles ahead of your aircraft
+5. **Increase prefetch lookahead:** Set `prefetch_lookahead = 30` or higher for faster aircraft
+
+**Recommended settings for stutter-free flying:**
+```ini
+use_time_budget = True
+tile_time_budget = 180
+fallback_level = cache
+fallback_extends_budget = False
+prefetch_enabled = True
+prefetch_lookahead = 30
+max_zoom_level = 16
+```
+
+**Trade-off:** You may see occasional blurry or missing tiles, but your flight will be smoother.
+
+---
+
+### Why does loading take so long at startup?
+
+At startup, X-Plane requests the initial scenery tiles. Loading time depends on:
+
+1. **Zoom level (biggest factor):** Each zoom level increase requires **4× more resources**
+2. **Number of tiles:** More tiles = more total work
+3. **Network speed:** Slower connections = longer downloads
+4. **CPU speed:** Slower CPUs = longer decode/compress times
+5. **Time budget:** Higher budgets = more time spent per tile
+
+**To speed up startup:**
+- **Lower your Max Zoom Level** - This has the biggest impact! ZL16→ZL15 is 4× faster
+- Use a lower `tile_time_budget` (180-300 seconds)
+- Enable `suspend_maxwait = True` to use extended timeouts only during startup
+- The second time you load the same area will be faster (cached data)
+
+**Zoom Level Resource Scaling:**
+| Zoom | Chunks/Tile | Relative Load Time |
+|------|-------------|-------------------|
+| ZL15 | 64 | 1× (baseline) |
+| ZL16 | 256 | 4× |
+| ZL17 | 1024 | 16× |
+| ZL18 | 4096 | 64× |
+
+See the [Performance Tuning Guide](performance.md#zoom-level-critical-performance-factor) for detailed zoom level recommendations.
+
+---
+
+### What do the Performance Tuning settings mean?
+
+| Setting | What it controls |
+|---------|-----------------|
+| **Tile Time Budget** | Total seconds to wait for a tile before returning partial results |
+| **Fallback Level** | How aggressively to find replacement imagery for failed chunks |
+| **Fallback Extends Budget** | Whether to continue network fallbacks after budget is exhausted |
+| **Prefetch Enabled** | Whether to download tiles ahead of your aircraft |
+| **Prefetch Lookahead** | How many seconds of flight time to prefetch ahead |
+
+For detailed explanations, see the [Performance Tuning Guide](performance.md).
+
+---
+
+### What is the Native Pipeline and do I need it?
+
+The **native pipeline** (`aopipeline`) is an optional high-performance component that dramatically speeds up DDS texture building (10-20x faster). It's written in C and uses true multi-threading via OpenMP.
+
+**Do you need it?** 
+- If it's available for your platform (included in releases), it's used automatically
+- If not available, AutoOrtho falls back to the Python implementation
+- All features work either way; native is just faster
+
+**Benefit:** Significantly fewer stutters, especially during initial scenery load or when flying fast/low.
+
+See the [Native Pipeline Architecture](performance.md#native-pipeline-architecture) for technical details.
+
+---
+
+### Why are Apple Maps downloads slower than other sources?
+
+**Apple Maps always uses the Python HTTP client**, not the native libcurl client. This is intentional because Apple Maps requires:
+
+1. **Dynamic authentication**: Tokens must be fetched via DuckDuckGo proxy
+2. **Token rotation**: On 403/410 errors, the token must be refreshed
+3. **Special headers**: Requires `Authorization: Bearer` headers
+
+The Python path handles all this authentication flow correctly. Other imagery sources (BI, EOX, ARC, NAIP, USGS, FIREFLY, YNDX, GO2) use the faster native HTTP client.
+
+**Impact:** Apple Maps initial loading may be 2-3x slower than other sources. Once cached, performance is identical.
+
+**Workaround:** Consider using an alternative imagery source if download speed is critical.
+
+---
+
+### I changed the settings but nothing seems different
+
+1. **Restart AutoOrtho:** Some settings require a restart to take effect
+2. **Clear cache:** Old cached data may affect results. Try clearing the cache
+3. **Fly a new route:** Cached areas will use existing data. Try an area you haven't visited
+4. **Check config file:** Verify your `~/.autoortho` file has the expected values
+
+---
+
+### What's the difference between maxwait and tile_time_budget?
+
+| Setting | Scope | Behavior |
+|---------|-------|----------|
+| `maxwait` (legacy) | Per-chunk timeout | Each of 256 chunks waits up to this long |
+| `tile_time_budget` (new) | Whole-tile budget | Total wall-clock time for entire tile request |
+
+**Example:** With `maxwait = 1.5s` and 256 chunks:
+- Worst case: 256 × 1.5s = 384 seconds (due to serial execution)
+- Actual time varies widely based on parallelism
+
+**Example:** With `tile_time_budget = 180s`:
+- Always release a tile to X-Plane within 180 seconds (predictable)
+- May have some missing chunks if network is slow or zoom level is high
+
+**Recommendation:** Keep `use_time_budget = True` to use the new predictable system.
+
+### Time exclusion re-activated after scenery reload
+
+**Symptom:** You have "Default to Exclusion" enabled, the exclusion correctly deactivated when sim time showed daytime, but after triggering "Reload Scenery" the exclusion incorrectly re-activated and you see global scenery instead of orthos.
+
+**Solution:** This issue has been fixed. AutoOrtho now preserves the exclusion decision made based on actual sim time during temporary disconnections (like scenery reload).
+
+If you're still experiencing this issue:
+1. Make sure you're running the latest version of AutoOrtho
+2. If the state seems "stuck", restart AutoOrtho to reset to the default behavior
+
+**Technical details:** When X-Plane reloads scenery, the UDP connection temporarily disconnects, making sim time unavailable. AutoOrtho now remembers the last decision made with real sim time and uses it during these brief disconnections, rather than falling back to the `default_to_exclusion` setting.
+
+See [Time Exclusion - Decision Preservation](performance.md#decision-preservation-during-scenery-reload) for more details.
 
 ### I see a messge in the logs, but otherwise things work fine.
 The log will log various things, typically info and warnings can be ignored

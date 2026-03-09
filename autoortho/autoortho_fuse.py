@@ -9,19 +9,42 @@ import errno
 import ctypes
 import threading
 
-import flighttrack
+# Handle imports for both frozen (PyInstaller) and direct Python execution
+try:
+    from autoortho import flighttrack
+except ImportError:
+    import flighttrack
 
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from functools import wraps, lru_cache
 
-from aoconfig import CFG
-from utils.constants import system_type
+try:
+    from autoortho.aoconfig import CFG
+except ImportError:
+    from aoconfig import CFG
+
+try:
+    from autoortho.utils.constants import system_type
+except ImportError:
+    from utils.constants import system_type
+
+try:
+    from autoortho.time_exclusion import time_exclusion_manager
+except ImportError:
+    from time_exclusion import time_exclusion_manager
+
 import logging
 log = logging.getLogger(__name__)
 
-from mfusepy import FUSE, FuseOSError, Operations, fuse_get_context, _libfuse
+try:
+    from autoortho.mfusepy import FUSE, FuseOSError, Operations, fuse_get_context, _libfuse
+except ImportError:
+    from mfusepy import FUSE, FuseOSError, Operations, fuse_get_context, _libfuse
 
-import getortho
+try:
+    from autoortho import getortho
+except ImportError:
+    import getortho
 
 def _rgb_to_rgb565(r: int, g: int, b: int) -> int:
     """Convert RGB888 to RGB565 format used by BC1/DXT1 compression."""
@@ -200,11 +223,49 @@ def fuse_option_profiles_by_os(nothreads: bool, mount_name: str) -> dict:
             allow_other=True,
         ))
     elif system_type == 'darwin':
+        # Calculate daemon_timeout based on max possible tile_time_budget + 60s buffer.
+        # This prevents macFUSE from killing the worker when operations take longer
+        # than the default 60 second timeout.
+        #
+        # Max tile_time_budget calculation (matches _calculate_build_timeout):
+        # - Base: tile_time_budget (default 180s)
+        # - Startup multiplier: 10x during initial loading (capped at 1800s)
+        # - Fallback: + fallback_timeout if enabled (default 30s)
+        # - Buffer: + 15s for DDS operations
+        # - Safety: + 60s additional buffer for daemon_timeout
+        tile_budget = getattr(CFG.autoortho, 'tile_time_budget', 180.0)
+        if isinstance(tile_budget, str):
+            try:
+                tile_budget = float(tile_budget)
+            except ValueError:
+                tile_budget = 180.0
+        
+        # Use max startup budget (10x multiplier, capped at 1800s)
+        max_startup_budget = min(tile_budget * 10.0, 1800.0)
+        
+        # Add fallback timeout if enabled
+        fallback_extends = getattr(CFG.autoortho, 'fallback_extends_budget', False)
+        if isinstance(fallback_extends, str):
+            fallback_extends = fallback_extends.lower().strip() in ('true', '1', 'yes', 'on')
+        fallback_timeout = 0
+        if fallback_extends:
+            fallback_timeout = getattr(CFG.autoortho, 'fallback_timeout', 30)
+            if isinstance(fallback_timeout, str):
+                try:
+                    fallback_timeout = float(fallback_timeout)
+                except ValueError:
+                    fallback_timeout = 30
+        
+        # daemon_timeout = max_build_timeout + 60s safety buffer
+        # max_build_timeout = max_startup_budget + fallback_timeout + 15s buffer
+        daemon_timeout = int(max_startup_budget + fallback_timeout + 15 + 60)
+        
         options.update(dict(
             nothreads=nothreads,
             foreground=True,
             allow_other=True,
             volname=mount_name,
+            daemon_timeout=daemon_timeout,
         ))
 
     elif system_type == 'windows':
@@ -246,6 +307,19 @@ class AutoOrtho(Operations):
         self.cache_dir = cache_dir
 
         self.tc = getortho.TileCacher(cache_dir)
+        
+        # Register terrain index for this scenery
+        # This indexes .ter files to discover actual tile zoom levels
+        # Critical for predictive DDS: ensures we prefetch the exact tiles X-Plane will request
+        terrain_folder = os.path.join(self.root, "terrain")
+        scenery_name = os.path.basename(self.root)
+        getortho.register_terrain_index(terrain_folder, scenery_name)
+        
+        # Start spatial prefetcher for proactive tile loading
+        getortho.start_prefetcher(self.tc)
+        
+        # Start predictive DDS generation (pre-builds DDS in background)
+        getortho.start_predictive_dds(self.tc)
     
         #self.path_condition = threading.Condition()
         #self.read_lock = threading.Lock()
@@ -257,11 +331,23 @@ class AutoOrtho(Operations):
         self.startup = True
         self._lock = threading.RLock()
         self._tile_locks = defaultdict(threading.Lock)
-        self._size_cache = {}
+        self._size_cache = OrderedDict()  # LRU cache for DDS sizes
+        self._size_cache_max = 5000  # Max entries before LRU eviction
         self._ft_started = False
         self._ft_start_lock = threading.Lock()
 
+        # Track redirected DSF file handles: fh -> redirect_path
+        # Used when time exclusion redirects DSF reads to global scenery
+        self._redirected_dsf_fhs = {}
+
         self.use_ns = kwargs.get("use_ns", False)
+        
+        # Initialize time exclusion manager with dataref tracker
+        try:
+            from autoortho.datareftrack import dt as datareftracker
+        except ImportError:
+            from datareftrack import dt as datareftracker
+        time_exclusion_manager.set_dataref_tracker(datareftracker)
 
     # Helpers
     # =======
@@ -326,6 +412,66 @@ class AutoOrtho(Operations):
     def _tile_key(self, row, col, maptype, zoom):
         return (row, col, maptype, zoom)
 
+    def _calculate_build_timeout(self):
+        """
+        Calculate dynamic build_timeout based on tile_time_budget settings.
+        
+        This ensures the FUSE lock timeout is always sufficient for tile building:
+        - Base: tile_time_budget (time allowed for chunk downloads)
+        - Startup: applies same multiplier (3x, capped at 300s) when suspend_maxwait 
+          is enabled and not yet connected to X-Plane
+        - Extended: + fallback_timeout if fallback_extends_budget is enabled
+        - Buffer: + 15 seconds for DDS operations and overhead
+        
+        Returns timeout in seconds (int).
+        """
+        # Get tile_time_budget (default 120s)
+        tile_budget = getattr(CFG.autoortho, 'tile_time_budget', 120.0)
+        if isinstance(tile_budget, str):
+            try:
+                tile_budget = float(tile_budget)
+            except ValueError:
+                tile_budget = 120.0
+        
+        # Account for startup multiplier - must match getortho.py logic
+        # During initial startup (before first connection), budget is multiplied.
+        # Uses has_ever_connected to distinguish true startup from temporary disconnects
+        # caused by stuttering (which should NOT get extended timeouts).
+        try:
+            from datareftrack import dt as datareftracker
+            suspend_maxwait = getattr(CFG.autoortho, 'suspend_maxwait', True)
+            if isinstance(suspend_maxwait, str):
+                suspend_maxwait = suspend_maxwait.lower().strip() in ('true', '1', 'yes', 'on')
+            
+            if suspend_maxwait and not getattr(datareftracker, 'has_ever_connected', False):
+                # Match getortho.py: 10x multiplier for initial loading
+                startup_multiplier = 10.0
+                max_startup_budget = 1800.0
+                tile_budget = min(tile_budget * startup_multiplier, max_startup_budget)
+        except ImportError:
+            pass  # datareftracker not available, use base budget
+        
+        # Check if fallback extends the budget
+        fallback_extends = getattr(CFG.autoortho, 'fallback_extends_budget', False)
+        if isinstance(fallback_extends, str):
+            fallback_extends = fallback_extends.lower().strip() in ('true', '1', 'yes', 'on')
+        
+        # Get fallback_timeout if extended fallbacks are enabled (default 30s)
+        fallback_timeout = 0
+        if fallback_extends:
+            fallback_timeout = getattr(CFG.autoortho, 'fallback_timeout', 30)
+            if isinstance(fallback_timeout, str):
+                try:
+                    fallback_timeout = float(fallback_timeout)
+                except ValueError:
+                    fallback_timeout = 30
+        
+        # Calculate total: budget + extended fallback + 15s buffer
+        # The 15s buffer accounts for DDS read/write, processing overhead, and safety margin
+        build_timeout = int(tile_budget + fallback_timeout + 15)
+        
+        return build_timeout
+
     def _failfast(self, msg, exc=None):
         log.error(msg)
         if exc:
@@ -357,18 +503,32 @@ class AutoOrtho(Operations):
 
     @lru_cache(maxsize=1024)
     def _calculate_dds_size(self, zoom):
-        """Calculate the actual DDS file size based on tile parameters and current configuration."""
+        """Calculate the actual DDS file size based on tile parameters and current configuration.
+        
+        IMPORTANT: In dynamic zoom mode, the actual tile zoom can vary based on altitude prediction.
+        To avoid truncated texture issues, we calculate size for the MAXIMUM possible zoom level
+        that a tile could use, which is zoom + 1 (the X-Plane limit for tile imagery).
+        This ensures FUSE always reports a size >= the actual DDS size.
+        """
         try:
             # Convert parameters to the format expected by the tile system
             zoom = int(zoom)
             
-            # Replicate the max_zoom selection logic from TileCacher
-            if CFG.autoortho.using_custom_tiles:
-                uncapped_target_zoom = self.tc.target_zoom_level
+            # Check if dynamic zoom mode is enabled
+            max_zoom_mode = str(CFG.autoortho.max_zoom_mode).lower()
+            
+            if max_zoom_mode == "dynamic":
+                # In dynamic zoom mode, the actual zoom can be up to zoom + 1
+                # We MUST use the maximum possible size to avoid X-Plane seeing truncated textures
+                # (the DDS header declares the full size, so the file must be at least that big)
+                max_zoom = zoom + 1
             else:
-                uncapped_target_zoom = self.tc.target_zoom_level_near_airports if zoom == 18 else self.tc.target_zoom_level
-
-            max_zoom = min(zoom + 1,uncapped_target_zoom)
+                # Fixed mode - use the configured target zoom levels
+                if CFG.autoortho.using_custom_tiles:
+                    uncapped_target_zoom = self.tc.target_zoom_level
+                else:
+                    uncapped_target_zoom = self.tc.target_zoom_level_near_airports if zoom == 18 else self.tc.target_zoom_level
+                max_zoom = min(zoom + 1, uncapped_target_zoom)
             
             # Replicate tile dimension calculation logic from Tile.__init__
             width = 16  # Default tile width in chunks
@@ -418,14 +578,70 @@ class AutoOrtho(Operations):
                 return 22369776
 
 
-    @lru_cache(maxsize=1024)
     def getattr(self, path, fh=None):
         log.debug(f"GETATTR {path}")
-
-
-        m = self.dds_re.match(path)
-
+        
+        # Check for DSF time exclusion redirect
+        # Instead of hiding DSF files (which breaks X-Plane's indexing),
+        # we redirect to X-Plane's global scenery DSF files
+        if self.dsf_re.match(path):
+            redirect_path = time_exclusion_manager.get_redirect_path(path)
+            if redirect_path:
+                log.debug(f"GETATTR: Redirecting DSF to global scenery: {path} -> {redirect_path}")
+                return self._getattr_redirected_dsf(redirect_path)
+        
+        # Generate fresh timestamps for each call
         now = int(time.time())
+        
+        m = self.dds_re.match(path)
+        if m:
+            # DDS files are virtual - use cached size calculation but fresh timestamps
+            return self._getattr_dds(path, m, now)
+        elif path.endswith(".poison"):
+            return self._getattr_poison(now)
+        elif path.endswith("AOISWORKING"):
+            return self._getattr_marker(now)
+        else:
+            # Real filesystem files - never cache, always get fresh stats
+            return self._getattr_real_file(path)
+
+    def _get_dds_size_cached(self, row, col, maptype, zoom):
+        """Get DDS size from cache or compute it.
+        
+        Uses _size_cache OrderedDict with LRU eviction to prevent unbounded
+        memory growth. Cache can be updated with actual tile sizes when tiles
+        are opened (see open() method).
+        """
+        key = (row, col, maptype, zoom)
+        dds_size = self._size_cache.get(key)
+        if dds_size is not None:
+            # Move to end for LRU
+            self._size_cache.move_to_end(key)
+            return dds_size
+        
+        dds_size = self._calculate_dds_size(str(zoom))
+        # Evict oldest entries if at limit
+        while len(self._size_cache) >= self._size_cache_max:
+            self._size_cache.popitem(last=False)
+        self._size_cache[key] = dds_size
+        return dds_size
+    
+    def _set_dds_size_cached(self, row, col, maptype, zoom, size):
+        """Set actual DDS size in cache with LRU eviction."""
+        key = (row, col, maptype, zoom)
+        # Evict oldest entries if at limit
+        while len(self._size_cache) >= self._size_cache_max:
+            self._size_cache.popitem(last=False)
+        self._size_cache[key] = size
+        self._size_cache.move_to_end(key)
+
+    def _getattr_dds(self, path, match, now):
+        """Get attributes for virtual DDS files."""
+        self._ensure_flighttrack_started(reason_path=path)
+        row, col, maptype, zoom = match.groups()
+        dds_size = self._get_dds_size_cached(int(row), int(col), maptype, int(zoom))
+        log.debug("GETATTR: Fetch for path: %s", path)
+        
         attrs = {
             'st_atime': now, 
             'st_ctime': now, 
@@ -435,34 +651,83 @@ class AutoOrtho(Operations):
             'st_nlink': 1,
             'st_uid': self.default_uid,
             'st_gid': self.default_gid,
+            'st_size': dds_size,
         }
-        if m:
-            self._ensure_flighttrack_started(reason_path=path)
-            row, col, maptype, zoom = m.groups()
-            key = (int(row), int(col), maptype, int(zoom))
-            dds_size = self._size_cache.get(key)
-            log.debug("GETATTR: Fetch for path: %s", path)
-            if dds_size is None:
-                dds_size = self._calculate_dds_size(zoom)
+        log.debug(f"GETATTR: ATTRS: {attrs}")
+        return attrs
 
-            attrs['st_size'] = dds_size
+    def _getattr_poison(self, now):
+        """Handle poison pill for shutdown."""
+        log.info("Poison pill.  Exiting!")
+        fuse_ptr = ctypes.c_void_p(_libfuse.fuse_get_context().contents.fuse)
+        do_fuse_exit(fuse_ptr=fuse_ptr)
+        
+        attrs = {
+            'st_atime': now, 
+            'st_ctime': now, 
+            'st_mtime': now,
+            'st_mode': 33206,
+            'st_blksize': 32768,
+            'st_nlink': 1,
+            'st_uid': self.default_uid,
+            'st_gid': self.default_gid,
+            'st_size': 0,
+        }
+        return attrs
 
-        elif path.endswith(".poison"):
+    def _getattr_marker(self, now):
+        """Get attributes for AOISWORKING marker file."""
+        attrs = {
+            'st_atime': now, 
+            'st_ctime': now, 
+            'st_mtime': now,
+            'st_mode': 33206,
+            'st_blksize': 32768,
+            'st_nlink': 1,
+            'st_uid': self.default_uid,
+            'st_gid': self.default_gid,
+            'st_size': 0,
+        }
+        return attrs
 
-            attrs['st_size'] = 0
-            log.info("Poison pill.  Exiting!")
-            fuse_ptr = ctypes.c_void_p(_libfuse.fuse_get_context().contents.fuse)
-            do_fuse_exit(fuse_ptr=fuse_ptr)
-
-        elif path.endswith("AOISWORKING"):
-            attrs['st_size'] = 0
-
-        else:
-            full_path = self._full_path(path)
-            exists = os.path.exists(full_path)
-            log.debug(f"GETATTR FULLPATH {full_path}  Exists? {exists}")
-            st = os.lstat(full_path)
-            log.debug(f"GETATTR: Orig stat: {st}")
+    def _getattr_real_file(self, path):
+        """Get attributes for real filesystem files - never cached."""
+        full_path = self._full_path(path)
+        exists = os.path.exists(full_path)
+        log.debug(f"GETATTR FULLPATH {full_path}  Exists? {exists}")
+        st = os.lstat(full_path)
+        log.debug(f"GETATTR: Orig stat: {st}")
+        attrs = {k: getattr(st, k) for k in (
+            'st_atime',
+            'st_ctime',
+            'st_gid',
+            'st_mode',
+            'st_mtime',
+            'st_nlink',
+            'st_size',
+            'st_uid',
+            'st_ino',
+            'st_dev',
+        )}
+        log.debug(f"GETATTR: ATTRS: {attrs}")
+        return attrs
+    
+    def _getattr_redirected_dsf(self, redirect_path):
+        """Get attributes for a DSF file redirected to global scenery.
+        
+        When time exclusion is active, DSF reads are redirected to X-Plane's
+        global scenery instead of serving empty/hidden files. This ensures
+        X-Plane always has terrain data.
+        
+        Args:
+            redirect_path: Absolute path to the global scenery DSF file
+            
+        Returns:
+            dict: File attributes from the redirected DSF file
+        """
+        try:
+            st = os.lstat(redirect_path)
+            log.debug(f"GETATTR: Redirected DSF stat: {st}")
             attrs = {k: getattr(st, k) for k in (
                 'st_atime',
                 'st_ctime',
@@ -474,20 +739,31 @@ class AutoOrtho(Operations):
                 'st_uid',
                 'st_ino',
                 'st_dev',
-                )}
+            )}
+            log.debug(f"GETATTR: Redirected DSF ATTRS: {attrs}")
+            return attrs
+        except OSError as e:
+            log.warning(f"GETATTR: Failed to stat redirected DSF {redirect_path}: {e}")
+            raise FuseOSError(e.errno)
 
-        log.debug(f"GETATTR: ATTRS: {attrs}")
-        return attrs
-
-    @lru_cache(maxsize=1024)
     def readdir(self, path, fh):
-
+        """List directory contents.
+        
+        DSF files are ALWAYS shown regardless of time exclusion state.
+        X-Plane indexes DSF files at flight load time - hiding them causes
+        missing terrain. Instead, we redirect reads to global scenery DSF files.
+        """
         if path in ["/textures", "/terrain"]:
             return ['.', '..', 'AOISWORKING']
 
         full_path = self._full_path(path)
         if os.path.isdir(full_path):
-            return ['.', '..', *os.listdir(full_path)]
+            entries = ['.', '..']
+            for entry in os.listdir(full_path):
+                # DSF files are always included - never filter them out
+                # Time exclusion is handled by redirecting reads, not hiding files
+                entries.append(entry)
+            return entries
         return ['.', '..']
 
     def readlink(self, path):
@@ -508,7 +784,7 @@ class AutoOrtho(Operations):
     def mkdir(self, path, mode):
         return os.mkdir(self._full_path(path), mode)
 
-    @lru_cache
+    @lru_cache(maxsize=128)
     def statfs(self, path):
         #log.info(f"STATFS: {path}")
         full_path = self._full_path(path)
@@ -567,8 +843,30 @@ class AutoOrtho(Operations):
         full_path = self._full_path(path)
         log.debug(f"OPEN: FULLPATH {full_path}")
 
+        # Handle DSF files with time exclusion redirect
         if self.dsf_re.match(path):
-            log.info(f"OPEN: Detected DSF open: {path}")
+            # Check if DSF should be redirected to global scenery
+            redirect_path = time_exclusion_manager.get_redirect_path(path)
+            if redirect_path:
+                log.info(f"OPEN: DSF [{path}] opened in GLOBAL SCENERY mode (time exclusion active) -> {redirect_path}")
+                try:
+                    if system_type == 'windows':
+                        fh = os.open(redirect_path, flags | os.O_BINARY)
+                    else:
+                        fh = os.open(redirect_path, flags)
+                    # Track this as a redirected DSF for release()
+                    self._redirected_dsf_fhs[fh] = redirect_path
+                    # Register this DSF as being in use (safe transition)
+                    time_exclusion_manager.register_dsf_open(path)
+                    return fh
+                except OSError as e:
+                    log.warning(f"OPEN: Failed to open redirected DSF {redirect_path}: {e}, falling back to ORTHO mode")
+                    # Fall through to open the original file
+            
+            # Normal mode - serve AutoOrtho ortho scenery
+            log.info(f"OPEN: DSF [{path}] opened in ORTHO mode (AutoOrtho scenery)")
+            # Register this DSF as being in use (prevents redirect during active use)
+            time_exclusion_manager.register_dsf_open(path)
         
         dds_match = self.dds_re.match(path)
         if dds_match:
@@ -576,9 +874,15 @@ class AutoOrtho(Operations):
             row = int(row)
             col = int(col)
             zoom = int(zoom)
+            
+            # Register non-BI maptypes for terrain lookup (custom Ortho4XP tiles)
+            # This allows the prefetcher to also check for custom tile maptypes
+            if maptype != "BI":
+                getortho.register_discovered_maptype(maptype)
+            
             t = self.tc._open_tile(row, col, maptype, zoom)
             try:
-                self._size_cache[(row, col, maptype, zoom)] = t.dds.total_size
+                self._set_dds_size_cached(row, col, maptype, zoom, t.dds.total_size)
             except Exception:
                 log.debug(f"OPEN: Failed getting cache size for tile at {path}")
                 pass
@@ -611,37 +915,58 @@ class AutoOrtho(Operations):
             key = self._tile_key(row, col, maptype, zoom)
             lock = self._tile_locks[key]
             
-            # Get configurable timeout, default 60 seconds
-            build_timeout = getattr(CFG.fuse, 'build_timeout', 60)
-            if isinstance(build_timeout, str):
-                try:
-                    build_timeout = int(build_timeout)
-                except ValueError:
-                    build_timeout = 60
-            
+            # Calculate build_timeout dynamically based on tile_time_budget
+            # This ensures the FUSE lock timeout is always >= the tile build time
+            # Formula: tile_time_budget + fallback_timeout (if enabled) + 15s buffer
+            #
+            # The buffer accounts for:
+            # - DDS read/write operations after tile is built
+            # - Any processing overhead
+            # - Margin of safety to prevent premature lock timeout
+            build_timeout = self._calculate_build_timeout()
+
             if not lock.acquire(timeout=build_timeout):
                 # CRITICAL FIX: Instead of raising EIO (which causes CTD on Windows
                 # due to EXCEPTION_IN_PAGE_ERROR), return fallback placeholder data.
                 # X-Plane will show a gray/missing texture, but won't crash.
                 log.error(f"Tile build lock timeout for {key} after {build_timeout}s - returning fallback data")
+
+                # ═══════════════════════════════════════════════════════════════
+                # ENHANCED DIAGNOSTICS: Log tile state to help debug lock stalls
+                # ═══════════════════════════════════════════════════════════════
+                try:
+                    t = self.tc.tiles.get(self.tc._to_tile_id(row, col, maptype, zoom))
+                    if t:
+                        diag_refs = getattr(t, 'refs', 'N/A')
+                        diag_ready = t.ready.is_set() if hasattr(t, 'ready') else 'N/A'
+                        diag_dds = t.dds is not None if hasattr(t, 'dds') else 'N/A'
+                        diag_chunks = len(t.chunks) if hasattr(t, 'chunks') else 'N/A'
+                        diag_budget = None
+                        if hasattr(t, '_tile_time_budget') and t._tile_time_budget:
+                            budget = t._tile_time_budget
+                            diag_budget = f"elapsed={budget.elapsed:.1f}s, exhausted={budget.exhausted}"
+
+                        log.error(f"  DIAGNOSTIC: tile={t}, refs={diag_refs}, ready={diag_ready}, "
+                                 f"has_dds={diag_dds}, chunk_zooms={diag_chunks}, budget={diag_budget}")
+                    else:
+                        log.error(f"  DIAGNOSTIC: Tile not found in cache (may have been evicted)")
+                except Exception as diag_err:
+                    log.error(f"  DIAGNOSTIC: Failed to gather tile state: {diag_err}")
+                # ═══════════════════════════════════════════════════════════════
+
                 return _generate_fallback_dds_bytes(offset, length)
-            
+
             try:
                 t = self.tc._get_tile(row, col, maptype, zoom)
                 data = t.read_dds_bytes(offset, length)
                 if data is None:
-                    # CRITICAL FIX: Return fallback data instead of EIO
                     log.error(f"Tile read returned None for {key} - returning fallback data")
                     return _generate_fallback_dds_bytes(offset, length)
                 return data
             except FuseOSError:
-                # CRITICAL FIX: Catch EIO and return fallback instead
-                # This prevents Windows EXCEPTION_IN_PAGE_ERROR CTD
                 log.error(f"FUSE error for tile {key} - returning fallback data to prevent CTD")
                 return _generate_fallback_dds_bytes(offset, length)
             except Exception as e:
-                # CRITICAL FIX: Return fallback data instead of EIO
-                # This prevents Windows EXCEPTION_IN_PAGE_ERROR CTD
                 log.error(f"Tile read/build failed for {key} - returning fallback data to prevent CTD")
                 log.exception("cause:", exc_info=e)
                 return _generate_fallback_dds_bytes(offset, length)
@@ -689,6 +1014,17 @@ class AutoOrtho(Operations):
     #@locked
     def release(self, path, fh):
         log.debug(f"RELEASE: {path}")
+        
+        # Unregister DSF close for time exclusion tracking
+        if self.dsf_re.match(path):
+            log.debug(f"RELEASE: DSF closed: {path}")
+            time_exclusion_manager.register_dsf_close(path)
+            
+            # Clean up redirected DSF tracking
+            if fh in self._redirected_dsf_fhs:
+                log.debug(f"RELEASE: Cleaning up redirected DSF handle: {fh}")
+                del self._redirected_dsf_fhs[fh]
+        
         dds_match = self.dds_re.match(path)
         if dds_match:
             row, col, maptype, zoom = dds_match.groups()

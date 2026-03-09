@@ -8,7 +8,10 @@ if getattr(sys, 'frozen', False):
     multiprocessing.freeze_support()
 
 if os.environ.get("AO_RUN_MODE") == "macfuse_worker":
-    from macfuse_worker import main as _ao_worker_main
+    try:
+        from autoortho.macfuse_worker import main as _ao_worker_main
+    except ImportError:
+        from macfuse_worker import main as _ao_worker_main
     _ao_worker_main()
     os._exit(0)
 
@@ -17,14 +20,53 @@ import logging
 import logging.handlers
 import atexit, signal, threading
 import platform
-from aoconfig import CFG
 from pathlib import Path
-from utils.constants import system_type
+
+# Handle imports for both frozen (PyInstaller) and direct Python execution
+try:
+    try:
+        from autoortho.aoconfig import CFG
+    except ImportError:
+        from aoconfig import CFG
+except Exception as _cfg_err:
+    # Config loading failed (e.g., permission error creating dirs on fresh install).
+    # Log to stderr since logging isn't set up yet, then show a dialog on macOS.
+    import traceback
+    print(f"Fatal: Failed to load config: {_cfg_err}", file=sys.stderr)
+    traceback.print_exc(file=sys.stderr)
+    _log_path = os.path.join(os.path.expanduser("~"), ".autoortho-data", "logs", "autoortho.log")
+    _msg = (
+        "AutoOrtho failed to load configuration.\n\n"
+        + str(_cfg_err)
+        + "\n\nTry deleting ~/.autoortho and restarting."
+    )
+    try:
+        if sys.platform == "darwin":
+            import subprocess
+            _apple_script = f'''
+                display dialog "{_msg.replace('"', '\\"').replace(chr(10), '\\n')}" ¬
+                with title "AutoOrtho Error" ¬
+                buttons {{"OK"}} ¬
+                default button "OK" ¬
+                with icon stop
+            '''
+            subprocess.run(['osascript', '-e', _apple_script], capture_output=True)
+    except Exception:
+        pass
+    sys.exit(1)
+
+try:
+    from autoortho.utils.constants import system_type
+except ImportError:
+    from utils.constants import system_type
 
 # Install crash handler EARLY, before any C extensions load
 # This allows us to log C-level crashes (segfaults, access violations)
 try:
-    from crash_handler import install_crash_handler
+    try:
+        from autoortho.crash_handler import install_crash_handler
+    except ImportError:
+        from crash_handler import install_crash_handler
     install_crash_handler()
 except Exception as e:
     # Don't fail if crash handler can't be installed
@@ -35,7 +77,16 @@ except Exception as e:
 # ---------------------------------------------------------------------------
 
 def _global_shutdown(signum=None, frame=None):
-    """Run once on interpreter exit or termination signals to free memory."""
+    """Run once on interpreter exit or termination signals to free memory.
+    
+    This function orchestrates the shutdown of all AutoOrtho subsystems:
+    1. FlightTracker (Flask-SocketIO server + UDP listener)
+    2. DatarefTracker (X-Plane UDP connection)
+    3. TimeExclusionManager (background monitor)
+    4. StatsBatcher (stats aggregation)
+    5. getortho module (prefetcher, DDS builder, consolidator, workers)
+    6. Any remaining non-daemon threads
+    """
     if getattr(_global_shutdown, "_done", False):
         return
     _global_shutdown._done = True
@@ -57,13 +108,81 @@ def _global_shutdown(signum=None, frame=None):
     except Exception:
         pass
 
+    # 1. Stop FlightTracker Flask-SocketIO server first (longest to shutdown)
     try:
-        from autoortho.getortho import shutdown as _go_shutdown
+        try:
+            from autoortho import flighttrack
+        except ImportError:
+            import flighttrack
+        # Shutdown the Flask-SocketIO server
+        if hasattr(flighttrack, 'shutdown_server'):
+            flighttrack.shutdown_server()
+        # Stop the UDP listener thread
+        flighttrack.ft.stop()
+        log.debug("FlightTracker stopped")
+    except Exception as e:
+        log.debug(f"FlightTracker shutdown error: {e}")
+
+    # 2. Stop DatarefTracker
+    try:
+        try:
+            from autoortho.datareftrack import dt
+        except ImportError:
+            from datareftrack import dt
+        dt.stop()
+        log.debug("DatarefTracker stopped")
+    except Exception as e:
+        log.debug(f"DatarefTracker shutdown error: {e}")
+
+    # 3. Stop TimeExclusionManager
+    try:
+        try:
+            from autoortho.time_exclusion import time_exclusion_manager
+        except ImportError:
+            from time_exclusion import time_exclusion_manager
+        time_exclusion_manager.stop()
+        log.debug("TimeExclusionManager stopped")
+    except Exception as e:
+        log.debug(f"TimeExclusionManager shutdown error: {e}")
+
+    # 4. Stop stats batcher early to prevent errors during other shutdowns
+    try:
+        try:
+            from autoortho.getortho import stats_batcher
+        except ImportError:
+            from getortho import stats_batcher
+        if stats_batcher:
+            stats_batcher.stop()
+            log.debug("StatsBatcher stopped")
+    except Exception as e:
+        log.debug(f"StatsBatcher shutdown error: {e}")
+
+    # 5. Call getortho shutdown (handles prefetcher, DDS builder, consolidator, etc.)
+    try:
+        try:
+            from autoortho.getortho import shutdown as _go_shutdown
+        except ImportError:
+            from getortho import shutdown as _go_shutdown
         _go_shutdown()
+        log.debug("getortho shutdown complete")
+    except Exception as e:
+        log.debug(f"getortho shutdown error: {e}")
+
+    # 6. Report remaining alive threads
+    try:
+        alive = threading.enumerate()
+        for t in alive:
+            if t is threading.current_thread():
+                continue
+            log.debug(
+                "Thread still alive after shutdown: name=%s daemon=%s",
+                t.name,
+                t.daemon,
+            )
     except Exception:
         pass
 
-    # Join remaining non-daemon threads (best effort)
+    # 7. Join remaining non-daemon threads (best effort)
     try:
         for t in threading.enumerate():
             if t is threading.current_thread() or t.daemon:
@@ -75,7 +194,7 @@ def _global_shutdown(signum=None, frame=None):
     except Exception:
         pass
 
-    # Force exit if stubborn threads (like Flask server) won't terminate
+    # 8. Force exit if stubborn threads (like Flask server) won't terminate
     # This applies to all platforms, not just macOS
     try:
         remaining = [
@@ -193,7 +312,11 @@ try:
 except Exception:
     pass
 
-import autoortho
+# Handle imports for both frozen (PyInstaller) and direct Python execution
+try:
+    from autoortho import autoortho
+except ImportError:
+    import autoortho
 
 if __name__ == "__main__":
     try:

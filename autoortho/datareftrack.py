@@ -18,11 +18,195 @@ import time
 import struct
 import socket
 import threading
-from aoconfig import CFG
+import math
+from dataclasses import dataclass
+from typing import Optional, Dict, List
+
+# Handle imports for both frozen (PyInstaller) and direct Python execution
+try:
+    from autoortho.aoconfig import CFG
+except ImportError:
+    from aoconfig import CFG
+
 import logging
 
 log = logging.getLogger(__name__)
 UDP_IP = "127.0.0.1"
+
+
+# =============================================================================
+# FlightSample and FlightDataAverager
+# =============================================================================
+
+@dataclass
+class FlightSample:
+    """Single flight data sample with timestamp."""
+    timestamp: float
+    lat: float
+    lon: float
+    alt_ft: float
+    hdg: float
+    spd: float  # ground speed in m/s
+
+
+class FlightDataAverager:
+    """
+    Averages flight data samples over a time window.
+    
+    Used to smooth out instantaneous flight data for more stable predictions.
+    Handles circular averaging for heading (0/360 wraparound).
+    """
+    
+    # Configuration
+    WINDOW_SECONDS = 60.0  # Time window for averaging
+    MIN_SAMPLES = 5  # Minimum samples needed for valid average
+    
+    def __init__(self, window_seconds: float = None):
+        """Initialize the averager with optional custom window size."""
+        self._lock = threading.Lock()
+        self._samples: List[FlightSample] = []
+        if window_seconds is not None:
+            self.WINDOW_SECONDS = window_seconds
+    
+    def add_sample(self, lat: float, lon: float, alt_ft: float, 
+                   hdg: float, spd: float) -> None:
+        """
+        Add a new flight sample and prune old samples.
+        
+        Args:
+            lat: Latitude in degrees
+            lon: Longitude in degrees  
+            alt_ft: Altitude AGL in feet
+            hdg: Heading in degrees (0-360)
+            spd: Ground speed in m/s
+        """
+        now = time.time()
+        sample = FlightSample(
+            timestamp=now,
+            lat=lat,
+            lon=lon,
+            alt_ft=alt_ft,
+            hdg=hdg,
+            spd=spd
+        )
+        
+        with self._lock:
+            self._samples.append(sample)
+            self._prune_old_samples(now)
+    
+    def _prune_old_samples(self, now: float) -> None:
+        """Remove samples older than the window. Must be called with lock held."""
+        cutoff = now - self.WINDOW_SECONDS
+        self._samples = [s for s in self._samples if s.timestamp >= cutoff]
+    
+    def sample_count(self) -> int:
+        """Return number of samples in the window."""
+        with self._lock:
+            return len(self._samples)
+    
+    def is_valid(self) -> bool:
+        """Return True if we have enough samples for a valid average."""
+        with self._lock:
+            return len(self._samples) >= self.MIN_SAMPLES
+    
+    def clear(self) -> None:
+        """Clear all samples."""
+        with self._lock:
+            self._samples.clear()
+    
+    def get_averages(self) -> Optional[Dict]:
+        """
+        Compute averaged flight data.
+        
+        Returns:
+            dict with keys:
+                - 'lat': Average latitude
+                - 'lon': Average longitude
+                - 'alt_ft': Average altitude AGL in feet
+                - 'heading': Circular-averaged heading in degrees (0-360)
+                - 'ground_speed_mps': Average ground speed in m/s
+                - 'vertical_speed_fpm': Computed vertical speed in feet/minute
+            Returns None if not enough samples.
+        """
+        with self._lock:
+            if len(self._samples) < self.MIN_SAMPLES:
+                return None
+            
+            samples = list(self._samples)  # Copy for thread safety
+        
+        n = len(samples)
+        
+        # Simple averages
+        avg_lat = sum(s.lat for s in samples) / n
+        avg_lon = sum(s.lon for s in samples) / n
+        avg_alt = sum(s.alt_ft for s in samples) / n
+        avg_spd = sum(s.spd for s in samples) / n
+        
+        # Circular averaging for heading
+        avg_heading = self._circular_mean_heading([s.hdg for s in samples])
+        
+        # Compute vertical speed from altitude change over time
+        vertical_speed_fpm = self._compute_vertical_speed(samples)
+        
+        return {
+            'lat': avg_lat,
+            'lon': avg_lon,
+            'alt_ft': avg_alt,
+            'heading': avg_heading,
+            'ground_speed_mps': avg_spd,
+            'vertical_speed_fpm': vertical_speed_fpm,
+        }
+    
+    def _circular_mean_heading(self, headings: List[float]) -> float:
+        """
+        Compute circular mean of headings (handles 0/360 wraparound).
+        
+        Uses vector averaging: convert to unit vectors, average, then back to angle.
+        """
+        if not headings:
+            return 0.0
+        
+        # Convert to radians and compute x,y components
+        sin_sum = sum(math.sin(math.radians(h)) for h in headings)
+        cos_sum = sum(math.cos(math.radians(h)) for h in headings)
+        
+        # Average the components
+        n = len(headings)
+        avg_sin = sin_sum / n
+        avg_cos = cos_sum / n
+        
+        # Convert back to angle
+        avg_heading = math.degrees(math.atan2(avg_sin, avg_cos))
+        
+        # Normalize to 0-360
+        if avg_heading < 0:
+            avg_heading += 360.0
+        
+        return avg_heading
+    
+    def _compute_vertical_speed(self, samples: List[FlightSample]) -> float:
+        """
+        Compute vertical speed in feet per minute using linear regression.
+        
+        Uses the first and last samples if we have at least 2.
+        """
+        if len(samples) < 2:
+            return 0.0
+        
+        # Get time and altitude deltas
+        first = samples[0]
+        last = samples[-1]
+        
+        dt_seconds = last.timestamp - first.timestamp
+        if dt_seconds <= 0:
+            return 0.0
+        
+        dalt_ft = last.alt_ft - first.alt_ft
+        
+        # Convert to feet per minute
+        vertical_speed_fpm = (dalt_ft / dt_seconds) * 60.0
+        
+        return vertical_speed_fpm
 
 
 class DatarefTracker(object):
@@ -55,6 +239,12 @@ class DatarefTracker(object):
          "The real magnetic heading of the aircraft", 0),
         ("sim/flightmodel/position/groundspeed", "m/s",
          "The ground speed of the aircraft", 0),
+        ("sim/time/local_time_sec", "s",
+         "Local time (seconds since midnight)", 0),
+        ("sim/flightmodel2/position/pressure_altitude", "ft",
+         "Pressure altitude in standard atmosphere", 0),
+        ("sim/graphics/scenery/sun_pitch_degrees", "°",
+         "Sun elevation angle from horizontal (v9.40.0+)", 1),
     ]
     # fmt:on
 
@@ -64,7 +254,10 @@ class DatarefTracker(object):
         messages.
         """
         # Thread synchronization
-        self._lock = threading.Lock()
+        # Use RLock (reentrant lock) to allow the same thread to acquire the lock
+        # multiple times - required because properties like alt_agl_ft acquire the
+        # lock internally, and callers may already hold the lock when accessing them.
+        self._lock = threading.RLock()
         self._shutdown_flag = threading.Event()
 
         # Flight data (protected by _lock)
@@ -73,8 +266,15 @@ class DatarefTracker(object):
         self.alt = -1.0
         self.hdg = -1.0
         self.spd = -1.0
+        self.local_time_sec = -1.0  # Local time (seconds since midnight)
+        self.pressure_alt = -1.0  # Pressure altitude in feet
+        self.sun_pitch = -999.0  # Sun elevation angle (-90 to +90, -999 = invalid)
         self.connected = False
         self.data_valid = False
+        self.has_ever_connected = False  # True once first connection established
+
+        # Flight data averager for smoothed predictions
+        self.flight_averager = FlightDataAverager()
 
         # Thread management
         self.t = None
@@ -92,6 +292,54 @@ class DatarefTracker(object):
         self._build_messages()
 
         log.info("Dataref Tracker instance created")
+
+    @property
+    def alt_agl_ft(self) -> float:
+        """
+        Get altitude AGL in feet (thread-safe).
+        
+        Returns:
+            float: Altitude AGL in feet, or -1 if not available.
+        """
+        with self._lock:
+            if not self.connected or not self.data_valid:
+                return -1.0
+            # self.alt is in meters, convert to feet
+            return self.alt * 3.28084
+
+    def get_flight_averages(self) -> Optional[Dict]:
+        """
+        Get averaged flight data for stable predictions.
+        
+        Returns:
+            dict: Averaged flight data with 'heading', 'ground_speed_mps',
+                  'vertical_speed_fpm', 'lat', 'lon', 'alt_ft'.
+                  Returns None if not enough samples.
+        """
+        return self.flight_averager.get_averages()
+
+    def clear_flight_averages(self) -> None:
+        """Clear all flight averages (e.g., after reconnect)."""
+        self.flight_averager.clear()
+
+    def set_flight_averages(self, averages: Dict) -> None:
+        """
+        Set mock flight averages (for testing).
+        
+        Note: This directly sets the averages by adding samples to match.
+        For proper testing, use the flight_averager directly.
+        """
+        # This is a convenience method for tests
+        # Add enough samples to make averages valid
+        for _ in range(FlightDataAverager.MIN_SAMPLES):
+            self.flight_averager.add_sample(
+                lat=averages.get('lat', 0),
+                lon=averages.get('lon', 0),
+                alt_ft=averages.get('alt_ft', 0),
+                hdg=averages.get('heading', 0),
+                spd=averages.get('ground_speed_mps', 0)
+            )
+            time.sleep(0.001)  # Small delay for different timestamps
 
     def _build_messages(self):
         """
@@ -130,7 +378,8 @@ class DatarefTracker(object):
 
         Returns:
             dict: Flight data with keys 'lat', 'lon', 'alt', 'hdg',
-                  'spd', 'connected', 'data_valid', 'timestamp'.
+                  'spd', 'local_time_sec', 'pressure_alt', 'sun_pitch',
+                  'connected', 'data_valid', 'timestamp'.
                   Returns None if not connected or data is invalid.
         """
         with self._lock:
@@ -142,10 +391,57 @@ class DatarefTracker(object):
                 'alt': self.alt,
                 'hdg': self.hdg,
                 'spd': self.spd,
+                'local_time_sec': self.local_time_sec,
+                'pressure_alt': self.pressure_alt,
+                'sun_pitch': self.sun_pitch,
                 'connected': self.connected,
                 'data_valid': self.data_valid,
                 'timestamp': time.time()
             }
+
+    def get_local_time_sec(self):
+        """
+        Thread-safe getter for local sim time.
+
+        Returns:
+            float: Seconds since midnight in sim time, or -1 if not available.
+        """
+        with self._lock:
+            if not self.connected or not self.data_valid:
+                return -1.0
+            return self.local_time_sec
+
+    def get_pressure_alt(self):
+        """
+        Thread-safe getter for pressure altitude.
+
+        Returns:
+            float: Pressure altitude in feet, or -1 if not available.
+        """
+        with self._lock:
+            if not self.connected or not self.data_valid:
+                return -1.0
+            return self.pressure_alt
+
+    def get_sun_pitch(self):
+        """
+        Thread-safe getter for sun pitch (elevation angle).
+
+        The sun pitch is the angle of the sun above or below the horizon:
+        - Positive values: sun is above the horizon (daytime)
+        - Zero: sun is at the horizon (sunrise/sunset)
+        - Negative values: sun is below the horizon (twilight/night)
+          - < -6°: civil twilight ends
+          - < -12°: nautical twilight ends
+          - < -18°: astronomical twilight ends (full night)
+
+        Returns:
+            float: Sun pitch in degrees (-90 to +90), or -999 if not available.
+        """
+        with self._lock:
+            if not self.connected or not self.data_valid:
+                return -999.0
+            return self.sun_pitch
 
     def start(self):
         """Start the UDP listening thread."""
@@ -263,6 +559,8 @@ class DatarefTracker(object):
                 with self._lock:
                     if self.connected:
                         log.info("Flight has stopped.")
+                        # Clear flight averages when connection is lost
+                        self.flight_averager.clear()
                     self.connected = False
                     self.data_valid = False
 
@@ -301,13 +599,22 @@ class DatarefTracker(object):
                 if not self.connected:
                     log.info("Flight is starting.")
                     self.connected = True
+                    self.has_ever_connected = True  # Permanent flag for startup detection
 
-                if len(values) == 5:
+                # Accept 5+ values for backward compatibility
+                # (6th=local_time_sec, 7th=pressure_alt, 8th=sun_pitch)
+                if len(values) >= 5:
                     lat = values[0]
                     lon = values[1]
                     alt = values[2]
                     hdg = values[3]
                     spd = values[4]
+                    # local_time is optional (6th value) for backward compat
+                    local_time = values[5] if len(values) >= 6 else None
+                    # pressure_alt is optional (7th value)
+                    pressure_alt = values[6] if len(values) >= 7 else None
+                    # sun_pitch is optional (8th value)
+                    sun_pitch = values[7] if len(values) >= 8 else None
 
                     # Validate position data
                     if self._validate_position(lat, lon, alt):
@@ -316,10 +623,30 @@ class DatarefTracker(object):
                         self.alt = alt
                         self.hdg = hdg
                         self.spd = spd
+                        # Only update local_time_sec if we received it
+                        if local_time is not None:
+                            self.local_time_sec = local_time
+                        # Only update pressure_alt if we received it
+                        if pressure_alt is not None:
+                            self.pressure_alt = pressure_alt
+                        # Only update sun_pitch if we received it
+                        if sun_pitch is not None:
+                            self.sun_pitch = sun_pitch
                         self.data_valid = True
+                        
+                        # Feed the flight averager (alt is in meters, convert to feet)
+                        self.flight_averager.add_sample(
+                            lat=lat,
+                            lon=lon,
+                            alt_ft=alt * 3.28084,  # Convert meters to feet
+                            hdg=hdg,
+                            spd=spd
+                        )
                     else:
                         self.data_valid = False
                 else:
+                    # Not enough values - log and mark invalid
+                    log.debug(f"Incomplete packet: got {len(values)}, need 5+")
                     self.data_valid = False
 
             # Debug logging (uncomment if needed)
@@ -350,7 +677,9 @@ class DatarefTracker(object):
             try:
                 self.sock.sendto(message, (UDP_IP, int(udp_port)))
             except Exception as e:
-                log.warning(f"Failed to send dataref request: {e}")
+                # Don't log warnings during shutdown - socket errors are expected
+                if not self._shutdown_flag.is_set():
+                    log.warning(f"Failed to send dataref request: {e}")
                 raise
 
     def _decode_packet(self, data):
@@ -389,9 +718,12 @@ class DatarefTracker(object):
                 )
                 return []
 
-            # Decode all values
+            # Decode all values - use idx from packet to place in correct position
+            # X-Plane sends each value with its assigned index, which may not
+            # be in sequential order
             num_values = len(values_data) // self.VALUE_SIZE
-            retvalues = []
+            num_datarefs = len(self.datarefs)
+            retvalues = [None] * num_datarefs  # Pre-allocate with None
 
             for i in range(num_values):
                 offset = self.PACKET_HEADER_SIZE + (i * self.VALUE_SIZE)
@@ -399,12 +731,27 @@ class DatarefTracker(object):
 
                 try:
                     (idx, value) = struct.unpack("<if", singledata)
-                    retvalues.append(value)
+                    # Use the idx from the packet to place value correctly
+                    if 0 <= idx < num_datarefs:
+                        retvalues[idx] = value
+                    else:
+                        log.warning(
+                            f"Received dataref index {idx} out of range "
+                            f"(expected 0-{num_datarefs - 1})"
+                        )
                 except struct.error as e:
                     log.error(
                         f"Struct unpacking error at index {i}: {e}"
                     )
                     return []
+
+            # Check if we got all required values (first 5 are essential)
+            if any(v is None for v in retvalues[:5]):
+                log.debug("Incomplete packet: missing essential datarefs")
+                return []
+
+            # Replace remaining None values with -1.0 for optional datarefs
+            retvalues = [v if v is not None else -1.0 for v in retvalues]
 
             return retvalues
 

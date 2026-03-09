@@ -13,9 +13,55 @@ The resulting executable will be in dist/autoortho/
 
 import sys
 import os
-from PyInstaller.utils.hooks import collect_submodules, collect_data_files
+from PyInstaller.utils.hooks import collect_submodules, collect_data_files, collect_all
 
 block_cipher = None
+
+# =============================================================================
+# Collect modules with native extensions (required for Linux - have .so files)
+# =============================================================================
+
+def safe_collect_all(module_name):
+    """Safely collect all components of a module, returning empty lists on failure."""
+    try:
+        return collect_all(module_name)
+    except Exception:
+        return [], [], []
+
+# System monitoring
+psutil_datas, psutil_binaries, psutil_hiddenimports = safe_collect_all('psutil')
+
+# Numerical/scientific
+numpy_datas, numpy_binaries, numpy_hiddenimports = safe_collect_all('numpy')
+
+# Async/networking (gevent stack)
+greenlet_datas, greenlet_binaries, greenlet_hiddenimports = safe_collect_all('greenlet')
+gevent_datas, gevent_binaries, gevent_hiddenimports = safe_collect_all('gevent')
+zope_datas, zope_binaries, zope_hiddenimports = safe_collect_all('zope.interface')
+
+# Serialization
+msgpack_datas, msgpack_binaries, msgpack_hiddenimports = safe_collect_all('msgpack')
+
+# Flask dependencies with C extensions
+markupsafe_datas, markupsafe_binaries, markupsafe_hiddenimports = safe_collect_all('markupsafe')
+
+# Character encoding
+charset_datas, charset_binaries, charset_hiddenimports = safe_collect_all('charset_normalizer')
+
+# Collect all datas/binaries/hiddenimports for native modules
+native_module_datas = (
+    psutil_datas + numpy_datas + greenlet_datas + gevent_datas + 
+    zope_datas + msgpack_datas + markupsafe_datas + charset_datas
+)
+native_module_binaries = (
+    psutil_binaries + numpy_binaries + greenlet_binaries + gevent_binaries + 
+    zope_binaries + msgpack_binaries + markupsafe_binaries + charset_binaries
+)
+native_module_hiddenimports = (
+    psutil_hiddenimports + numpy_hiddenimports + 
+    greenlet_hiddenimports + gevent_hiddenimports + zope_hiddenimports + msgpack_hiddenimports + 
+    markupsafe_hiddenimports + charset_hiddenimports
+)
 
 # Determine platform
 if sys.platform == 'win32':
@@ -35,6 +81,8 @@ else:
 autoortho_path = os.path.join(os.getcwd(), 'autoortho')
 lib_path = os.path.join(autoortho_path, 'lib', platform_name)
 aoimage_path = os.path.join(autoortho_path, 'aoimage')
+aopipeline_path = os.path.join(autoortho_path, 'aopipeline')
+aopipeline_lib_path = os.path.join(aopipeline_path, 'lib', platform_name)
 
 # =============================================================================
 # Binary files (DLLs, shared libraries, executables)
@@ -48,6 +96,18 @@ elif sys.platform == 'darwin':
     binaries.append((os.path.join(aoimage_path, 'aoimage.dylib'), 'autoortho/aoimage'))
 else:
     binaries.append((os.path.join(aoimage_path, 'aoimage.so'), 'autoortho/aoimage'))
+
+# AoPipeline library and dependencies
+if sys.platform == 'win32':
+    binaries.append((os.path.join(aopipeline_lib_path, 'aopipeline.dll'), 'autoortho/aopipeline/lib/windows'))
+    binaries.append((os.path.join(aopipeline_lib_path, 'libgcc_s_seh-1.dll'), 'autoortho/aopipeline/lib/windows'))
+    binaries.append((os.path.join(aopipeline_lib_path, 'libgomp-1.dll'), 'autoortho/aopipeline/lib/windows'))
+    binaries.append((os.path.join(aopipeline_lib_path, 'libturbojpeg.dll'), 'autoortho/aopipeline/lib/windows'))
+    binaries.append((os.path.join(aopipeline_lib_path, 'libwinpthread-1.dll'), 'autoortho/aopipeline/lib/windows'))
+elif sys.platform == 'darwin':
+    binaries.append((os.path.join(aopipeline_lib_path, 'libaopipeline.dylib'), 'autoortho/aopipeline/lib/macos'))
+else:
+    binaries.append((os.path.join(aopipeline_lib_path, 'libaopipeline.so'), 'autoortho/aopipeline/lib/linux'))
 
 # Platform-specific compression libraries and tools
 if sys.platform == 'win32':
@@ -159,6 +219,36 @@ hiddenimports = [
     # Flask-SocketIO async drivers (required for frozen apps)
     'engineio.async_drivers.threading',
     'socketio.async_drivers.threading',
+    # AoPipeline modules (lazy imports - PyInstaller won't detect automatically)
+    'autoortho.aopipeline',
+    'autoortho.aopipeline.AoCache',
+    'autoortho.aopipeline.AoDecode',
+    'autoortho.aopipeline.AoDDS',
+    'autoortho.aopipeline.fallback_resolver',
+    # Cache path utilities
+    'autoortho.utils.cache_paths',
+    # 7-Zip wrapper (replaces py7zr)
+    'autoortho.utils.sevenzip',
+    # Async/networking stack
+    'greenlet',
+    'gevent',
+    'gevent.resolver',
+    'gevent.ssl',
+    'zope',
+    'zope.interface',
+    'zope.event',
+    # Serialization
+    'msgpack',
+    # NumPy
+    'numpy',
+    'numpy.core',
+    'numpy.core._multiarray_umath',
+    # Flask/Jinja dependencies
+    'markupsafe',
+    'markupsafe._speedups',
+    # Character encoding
+    'charset_normalizer',
+    'charset_normalizer.md',
 ]
 
 # Platform-specific hidden imports
@@ -180,9 +270,9 @@ elif sys.platform == 'win32':
 a = Analysis(
     [os.path.join(autoortho_path, '__main__.py')],
     pathex=[autoortho_path],
-    binaries=binaries,
-    datas=datas,
-    hiddenimports=hiddenimports,
+    binaries=binaries + native_module_binaries,
+    datas=datas + native_module_datas,
+    hiddenimports=hiddenimports + native_module_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

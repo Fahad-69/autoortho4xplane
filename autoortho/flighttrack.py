@@ -6,19 +6,34 @@ import time
 import json
 import socket
 import threading
-from aoconfig import CFG
+
+# Handle imports for both frozen (PyInstaller) and direct Python execution
+try:
+    from autoortho.aoconfig import CFG
+except ImportError:
+    from aoconfig import CFG
+
 import logging
 log = logging.getLogger(__name__)
 
 from flask import Flask, render_template, url_for, request, jsonify
 from flask_socketio import SocketIO, send, emit
 
-from xp_udp import DecodePacket, RequestDataRefs
+try:
+    from autoortho.xp_udp import DecodePacket, RequestDataRefs
+except ImportError:
+    from xp_udp import DecodePacket, RequestDataRefs
 
-from aostats import STATS
+try:
+    from autoortho.aostats import STATS
+except ImportError:
+    from aostats import STATS
 #STATS = {'count': 71036, 'chunk_hit': 66094, 'mm_counts': {0: 19, 1: 39, 2: 97, 3: 294, 4: 2982}, 'mm_averages': {0: 0.56, 1: 0.14, 2: 0.04, 3: 0.01, 4: 0.0}, 'chunk_miss': 4942, 'bytes_dl': 65977757}
 
 RUNNING=True
+
+# Shutdown flag for the Flask-SocketIO server
+_server_shutdown_requested = threading.Event()
 
 # Determine template folder for frozen vs dev mode
 if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
@@ -56,18 +71,24 @@ class FlightTracker(object):
     def start(self):
         self.running = True
         self.start_time = time.time()
-        self.t = threading.Thread(target=self._udp_listen)
+        self.t = threading.Thread(target=self._udp_listen, daemon=True)
         self.t.start()
 
     def get_info(self):
         RequestDataRefs(self.sock, CFG.flightdata.xplane_udp_port)
         data, addr = self.sock.recvfrom(1024)
         values = DecodePacket(data)
-        lat = values[0][0]
-        lon = values[1][0]
-        alt = values[3][0]
-        hdg = values[4][0]
-        spd = values[6][0]
+        
+        # Safely extract values - packet may not contain all expected datarefs
+        try:
+            lat = values[0][0]
+            lon = values[1][0]
+            alt = values[3][0]
+            hdg = values[4][0]
+            spd = values[6][0]
+        except KeyError as e:
+            log.debug(f"Incomplete packet in get_info, missing dataref index {e}")
+            return (self.lat, self.lon, self.alt, self.hdg, self.spd)  # Return last known values
 
         return (lat, lon, alt, hdg, spd)
 
@@ -110,16 +131,22 @@ class FlightTracker(object):
                 log.info("FT: Flight is starting.")
                 delta = time.time() - self.start_time
                 log.info(f"FT: Time to start was {round(delta/60, 2)} minutes.")
-                STATS['minutes_to_start'] = round(delta/60, 2)
 
             self.connected = True
 
             values = DecodePacket(data)
-            lat = values[0][0]
-            lon = values[1][0]
-            alt = values[3][0]
-            hdg = values[4][0]
-            spd = values[6][0]
+            
+            # Safely extract values - packet may not contain all expected datarefs
+            try:
+                lat = values[0][0]
+                lon = values[1][0]
+                alt = values[3][0]
+                hdg = values[4][0]
+                spd = values[6][0]
+            except KeyError as e:
+                # Incomplete packet - missing expected dataref indices
+                log.debug(f"Incomplete packet, missing dataref index {e}. Waiting for complete data...")
+                continue
 
             log.debug(f"Lat: {lat}, Lon: {lon}, Alt: {alt}")
             
@@ -134,9 +161,16 @@ class FlightTracker(object):
 
     def stop(self):
         log.info("FlightTracker shutdown requested.")
-        self.running=False
-        if self.t:
-            self.t.join()
+        self.running = False
+        # Close socket to unblock any pending recv operations
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+        if self.t and self.t.is_alive():
+            self.t.join(timeout=5.0)
+            if self.t.is_alive():
+                log.warning("FlightTracker UDP thread did not exit within timeout")
         log.info("FlightTracker exiting.")
 
 ft = FlightTracker()
@@ -200,10 +234,31 @@ def stats():
 def metrics():
     return STATS
 
+def shutdown_server():
+    """
+    Shutdown the Flask-SocketIO server gracefully.
+    
+    Call this function before ft.stop() to ensure clean exit.
+    """
+    global _server_shutdown_requested
+    log.info("FlightTracker server shutdown requested.")
+    _server_shutdown_requested.set()
+    try:
+        # socketio.stop() signals the server to stop accepting new connections
+        # and finish processing existing ones
+        socketio.stop()
+    except Exception as e:
+        log.debug(f"socketio.stop() error (may be expected): {e}")
+
+
 def run():
     #app.run(host='0.0.0.0', port=CFG.flightdata.webui_port, debug=CFG.general.debug, threaded=True, use_reloader=False)
     log.info("Start flighttracker...")
-    socketio.run(app, host='0.0.0.0', port=int(CFG.flightdata.webui_port))
+    try:
+        socketio.run(app, host='0.0.0.0', port=int(CFG.flightdata.webui_port))
+    except Exception as e:
+        if not _server_shutdown_requested.is_set():
+            log.error(f"FlightTracker server error: {e}")
     log.info("Exiting flighttracker ...") 
 
 def main():
