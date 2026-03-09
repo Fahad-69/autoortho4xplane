@@ -193,7 +193,7 @@ prefetch_lookahead = 30
 # How often to check for prefetch opportunities in seconds (1-10)
 prefetch_interval = 2.0
 # Maximum chunks to prefetch per cycle (8-512)
-prefetch_max_chunks = 32
+prefetch_max_chunks = 48
 # Prefetch radius in nautical miles (10-150)
 # Tiles within this radius of the flight path are prefetched
 # Used by both velocity-based and SimBrief prefetching
@@ -212,8 +212,8 @@ predictive_dds_build_interval_ms = 500
 # These run in the background to pre-build tiles ahead of where you're flying
 # Higher values = faster prefetch throughput, but more CPU usage during flight
 # Lower values = less CPU impact, slower prefetch
-# Recommended: 2 (balanced), 4 (fast CPU), 1 (low-end CPU or battery saving)
-background_builder_workers = 2
+# Recommended: 2 (low-end CPU or battery saving), 4 (balanced, default), 6-8 (fast CPU)
+background_builder_workers = 4
 # Number of concurrent tile build workers (1-32)
 # Controls how many tiles can be built simultaneously by the native pipeline
 # Higher values = faster tile processing, more CPU/RAM usage
@@ -234,10 +234,20 @@ predictive_dds_use_fallbacks = True
 # Uses temp directory, auto-cleaned on session end
 # Recommended: 4096 (balanced), 8192 (large flights), 16384 (max capacity)
 ephemeral_dds_cache_mb = 4096
-# Maximum threads for native pipeline (0 = auto from CPU cores)
-# Controls parallelism for cache I/O, JPEG decoding, and DDS compression
-# Lower values reduce CPU usage but slow down DDS building
-# Set to 1 for single-threaded mode (lowest CPU, slowest builds)
+# Persistent DDS cache - stores pre-built DDS textures across sessions
+# Eliminates JPEG decode + DXT compress on subsequent loads (~1-2ms read vs ~390ms rebuild)
+# Set to 0 to disable persistent DDS caching
+# Recommended: 4096 (balanced), 8192 (large regions), 0 (disk constrained)
+persistent_dds_cache_mb = 4096
+# Disk budget enforcement - automatically cleans up old cache data
+# When total cache exceeds file_cache_size, oldest data is evicted
+# Categories: DDS cache (compiled textures), JPEGs (source images)
+disk_budget_enabled = True
+# Percentage of file_cache_size allocated to persistent DDS cache (10-90)
+dds_budget_pct = 80
+# Maximum threads for native pipeline operations (per concurrent build)
+# 0 = auto (dynamically divides CPU cores across concurrent builds)
+# >0 = fixed thread count per build (e.g., 4 means each build uses 4 threads)
 native_pipeline_threads = 0
 # Pipeline mode for DDS texture building
 # auto: Automatically select best mode for your platform (recommended)
@@ -272,12 +282,15 @@ buffer_pool_size = 10
 # when sufficient chunks are available. Falls back to progressive path on failure.
 # Recommended: True (enables fast path when chunks are cached/prefetched)
 live_aopipeline_enabled = True
-# Minimum ratio of chunks that must be available for aopipeline build (0.0-1.0)
-# 0.9 = 90%%, allows up to 10%% missing (filled with missing_color)
-# Lower values may show more missing chunks but reduce latency
-# Higher values ensure quality but may fall back more often
-# Recommended: 0.9 (balanced), 0.8 (faster), 0.95 (quality)
-live_aopipeline_min_chunk_ratio = 0.9
+# Threshold ratio of chunks that triggers an early DDS build (0.5-1.0)
+# Controls a two-phase build strategy:
+#   1. Early build: fires when this ratio is reached, missing chunks filled with missing_color
+#   2. Healing pass: fires automatically when the remaining chunks arrive, replacing placeholders
+# 1.0 = wait for all chunks before building (single pass, no healing needed)
+# 0.9 = build at 90%%, heal remaining 10%% when they arrive (faster first texture, then corrected)
+# 0.5 = build at 50%% (fastest first texture, more healing work)
+# Recommended: 1.0 (quality, no artifacts), 0.9 (balanced), 0.8 (faster)
+live_aopipeline_min_chunk_ratio = 1.0
 # === STREAMING BUILDER SETTINGS ===
 # Enable streaming builder for incremental DDS generation (True/False)
 # When enabled, chunks are processed as they arrive rather than in batch.
@@ -327,10 +340,23 @@ show_loaded_tiles = False
 compressor = ISPC
 # BC1 or BC3 for dxt1 or dxt5 respectively
 format = BC1
+# Disk compression for cached DDS files (none or zstd)
+# zstd reduces cache disk usage by 30-60% with ~2-5ms added read latency
+# none stores raw DDS data (fastest reads, largest disk usage)
+dds_compression = zstd
+# Zstd compression level (1-19, default 3)
+# Higher = smaller files, slower writes (reads are always fast)
+# Background builds can afford higher levels since writes are async
+# Recommended: 3 (balanced), 6 (smaller files), 1 (fastest writes)
+dds_compression_level = 3
 
 [scenery]
 # Don't cleanup downloads
 noclean = False
+# Maximum parallel download workers for scenery packages (1-8)
+# Higher values download more files simultaneously, saturating bandwidth faster
+# Recommended: 4 (default), 2 (slow connection), 8 (fast connection)
+max_download_workers = 4
 
 [fuse]
 # Enable or disable multi-threading when using FUSE
@@ -362,21 +388,33 @@ fal_saturation = 80.0
 win_saturation = 55.0
 compress_dsf = True
 
+[terrain]
+# Default SUPER_ROUGHNESS value for .ter files (0.0 to 1.0)
+# Higher values make terrain less reflective/shiny at sunset/sunrise
+default_roughness = 1.0
+# Number of workers for .ter file patching
+ter_patch_workers = 8
+
 [windows]
 prefer_winfsp = True
 
 [time_exclusion]
-# Enable time-based AutoOrtho exclusion. When active during the specified time range,
-# AutoOrtho's scenery will be hidden and X-Plane will use its default scenery instead.
+# Enable sun-position-based AutoOrtho exclusion.
+# When active, AutoOrtho scenery is disabled at night and X-Plane uses its default scenery.
+# The sun elevation angle (from sim/graphics/scenery/sun_pitch_degrees) determines day/night.
+# This is accurate across seasons, latitudes, and with time acceleration.
 enabled = False
-# Start time for exclusion in 24-hour format (HH:MM), e.g. "22:00" for 10 PM
-start_time = 23:00
-# End time for exclusion in 24-hour format (HH:MM), e.g. "06:00" for 6 AM
-end_time = 05:00
-# When enabled, assume exclusion is active until sim time is available.
+# When enabled, assume exclusion is active until sun position data is available.
 # Useful to ensure night flights start with default scenery from the beginning.
-# When disabled, AutoOrtho works normally until sim time confirms exclusion.
+# When disabled, AutoOrtho works normally until sun data confirms exclusion.
 default_to_exclusion = False
+# Sun elevation threshold to switch to night mode (degrees).
+# Nautical twilight (-12) is when artificial lights dominate the landscape.
+# Range: -18 (astronomical twilight) to 0 (horizon).
+sun_night_threshold = -12.0
+# Sun elevation threshold to switch to day mode (degrees).
+# Should be higher than night threshold to provide hysteresis and prevent rapid toggling.
+sun_day_threshold = -10.0
 
 [simbrief]
 # SimBrief user ID for flight plan integration
@@ -552,9 +590,12 @@ route_prefetch_radius_nm = 40
         } for s in sceneries]
 
 
-        if not os.path.exists(self.ao_scenery_path):
-            log.info(f"Creating dir {self.ao_scenery_path}")
-            os.makedirs(self.ao_scenery_path)
+        if self.paths.scenery_path and not os.path.exists(self.ao_scenery_path):
+            try:
+                log.info(f"Creating dir {self.ao_scenery_path}")
+                os.makedirs(self.ao_scenery_path)
+            except OSError as e:
+                log.warning(f"Could not create scenery dir {self.ao_scenery_path}: {e}")
 
         # If we patched any values during load, persist them now so next run is stable.
         # Only save in the main process - workers must not write config files.
