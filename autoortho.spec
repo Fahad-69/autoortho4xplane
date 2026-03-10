@@ -24,9 +24,9 @@ if sys.platform == 'win32':
         tcl_dir = os.path.join(tcl_root, 'tcl8.6')
         tk_dir = os.path.join(tcl_root, 'tk8.6')
         if os.path.exists(tcl_dir):
-            tcl_datas.append((tcl_dir, 'tcl/tcl8.6'))
+            tcl_datas.append((tcl_dir, '_tcl_data/tcl8.6'))
         if os.path.exists(tk_dir):
-            tcl_datas.append((tk_dir, 'tcl/tk8.6'))
+            tcl_datas.append((tk_dir, '_tcl_data/tk8.6'))
     except ImportError:
         print("WARNING: tkinter not found, Tcl/Tk will not be bundled.")
 
