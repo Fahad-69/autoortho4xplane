@@ -20,7 +20,7 @@ if sys.platform == 'win32':
     tcl_dir = os.path.join('third_party', 'tcltk', 'tcl8.6')
     tk_dir = os.path.join('third_party', 'tcltk', 'tk8.6')
     tcl_datas.append((tcl_dir, '_tcl_data/tcl8.6'))
-    tcl_datas.append((tk_dir, '_tcl_data/tk8.6'))
+    tcl_datas.append((tk_dir, '_tk_data/tk8.6'))
 
 block_cipher = None
 
