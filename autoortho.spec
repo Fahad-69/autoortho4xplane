@@ -17,18 +17,10 @@ from PyInstaller.utils.hooks import collect_submodules, collect_data_files, coll
 
 tcl_datas = []
 if sys.platform == 'win32':
-    try:
-        import tkinter
-        import _tkinter
-        tcl_root = os.path.dirname(_tkinter.__file__)
-        tcl_dir = os.path.join(tcl_root, 'tcl8.6')
-        tk_dir = os.path.join(tcl_root, 'tk8.6')
-        if os.path.exists(tcl_dir):
-            tcl_datas.append((tcl_dir, '_tcl_data/tcl8.6'))
-        if os.path.exists(tk_dir):
-            tcl_datas.append((tk_dir, '_tcl_data/tk8.6'))
-    except ImportError:
-        print("WARNING: tkinter not found, Tcl/Tk will not be bundled.")
+    tcl_dir = os.path.join('third_party', 'tcltk', 'tcl8.6')
+    tk_dir = os.path.join('third_party', 'tcltk', 'tk8.6')
+    tcl_datas.append((tcl_dir, '_tcl_data/tcl8.6'))
+    tcl_datas.append((tk_dir, '_tcl_data/tk8.6'))
 
 block_cipher = None
 
